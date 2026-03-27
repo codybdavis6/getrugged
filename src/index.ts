@@ -807,7 +807,7 @@ bot.use(async (ctx, next) => {
 });
 
 bot.start(async (ctx) => {
-  const welcomeMessage = `🧬 GetRugged
+  const welcomeMessage = `🧬 Get ready to rugg niggers
 
   Launch faster on PumpFun with clean, simple flows.
 
