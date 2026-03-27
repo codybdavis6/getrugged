@@ -5,3 +5,4 @@ dist/
 site
 *.log
 .DS_Store
+site.zip
