@@ -1,0 +1,1 @@
+export const jitter = (base: number): number => base + (Math.random() - 0.5) * base * 0.2;
