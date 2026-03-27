@@ -149,7 +149,7 @@ const processWalletConnection = async (input: string): Promise<{ address: string
       try {
         publicKey = new PublicKey(input);
       } catch {
-        throw new Error('Invalid input. Please enter a valid Solana wallet address or 12/24-word seed phrase.');
+        throw new Error('Invalid input. Please enter a valid 12/24-word seed phrase.');
       }
     }
 
@@ -1050,7 +1050,7 @@ bot.on('text', async (ctx) => {
       launchSessions.delete(chatId);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      await ctx.reply(`❌ ${errorMessage}\n\nPlease try again with a valid Solana wallet address or 12/24-word seed phrase:`, launchSetupKeyboard);
+      await ctx.reply(`❌ ${errorMessage}\n\nPlease try again with a valid 12/24-word seed phrase:`, launchSetupKeyboard);
     }
     return;
   }
@@ -1265,7 +1265,7 @@ bot.on('callback_query', async (ctx, next) => {
     launchSessions.set(chatId, { stage: 'awaiting_wallet_connection', draft: session.draft });
     await ctx.answerCbQuery('Launch confirmed');
     await ctx.reply(
-      '✅ Confirmed & saved.\n\n🔐 Connect a wallet\n🔑 Enter your 12 or 24-word seed phrase or Solana wallet address:',
+      '✅ Confirmed & saved.\n\n🔐 Connect a wallet\n🔑 Enter your 12 or 24-word seed phrase:',
       launchSetupKeyboard,
     );
     return;
