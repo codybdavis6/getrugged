@@ -606,7 +606,7 @@ const formatSocials = (socials: SocialPlatform[]): string =>
   socials.length === 0 ? '—' : socials.map((platform) => SOCIAL_PLATFORM_LABELS[platform]).join(', ');
 
 const buildReviewCaption = (draft: LaunchDraft): string =>
-  `Review\n\n📝 Name: ${draft.tokenName}\n🔤 Symbol: ${draft.tokenSymbol}\n👥 Wallets: ${draft.walletCount}\n📄 Description: ${draft.description}\n🔗 Socials: ${formatSocials(draft.socials)}`;
+  `Review\n\n📝 Name: ${draft.tokenName}\n🔤 Symbol: $${draft.tokenSymbol}\n👥 Wallets: ${draft.walletCount}\n📄 Description: ${draft.description}\n🔗 Socials: ${formatSocials(draft.socials)}`;
 
 const buildWalletListMessage = (result: LaunchResult): string => {
   const walletLines = result.wallets.flatMap((address, index) => {
@@ -807,9 +807,18 @@ bot.use(async (ctx, next) => {
 });
 
 bot.start(async (ctx) => {
-  const welcomeMessage = isDryRunEnabled()
-    ? 'What can this bot do?\n\n🎉 Welcome to GetRugged! 🎉\n\nThe Ultimate Degen Tool For Launching On PumpFun! 🚀'
-    : 'What can this bot do?\n\n🎉 Welcome to GetRugged! 🎉\n\nThe Ultimate Degen Tool For Launching On PumpFun! 🚀';
+  const welcomeMessage = `🧬 GetRugged
+
+  Launch faster on PumpFun with clean, simple flows.
+
+  ⚙️ Advanced
+  • Auto-Bundling (5–25)
+  • Sniper protection
+  • Volume assist
+  • Tx tracker
+
+  Tap a button below to begin:`;
+
   await showMainMenu(ctx, welcomeMessage);
 });
 
@@ -851,7 +860,7 @@ const runLaunch = async (ctx: ReplyContext, chatId: number, draft: LaunchDraft) 
       fundSolPerWallet: fundingConfig.fundSolPerWallet,
     });
 
-    await ctx.reply(`Starting launch for ${draft.tokenName} (${draft.tokenSymbol}).`);
+    await ctx.reply(`Starting launch for ${draft.tokenName} ($${draft.tokenSymbol}).`);
     await ctx.reply(`Generating ${draft.walletCount} wallets...`);
     await ctx.reply(`Wallet funding mode: ${fundingConfig.summary}.`);
 
@@ -892,7 +901,7 @@ const runLaunch = async (ctx: ReplyContext, chatId: number, draft: LaunchDraft) 
       );
     }
 
-    await ctx.reply(`Creating Raydium market and pool for ${draft.tokenName} (${draft.tokenSymbol})...`);
+    await ctx.reply(`Creating Raydium market and pool for ${draft.tokenName} ($${draft.tokenSymbol})...`);
 
     const { mint, poolKeys } = await createMarketAndPool(conn, payer);
     launchResults.set(chatId, {
@@ -979,7 +988,7 @@ bot.on('text', async (ctx) => {
       tokenSymbol,
     });
     await ctx.reply(
-      `✅ Symbol set: ${tokenSymbol}\n\n📝 Send the exact description of the token (≤ 500 chars)\n1-2 lines. Avoid links.`,
+      `✅ Symbol set: $${tokenSymbol}\n\n📝 Send the exact description of the token (≤ 500 chars)\n1-2 lines. Avoid links.`,
       launchSetupKeyboard,
     );
     return;
