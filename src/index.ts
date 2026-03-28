@@ -807,7 +807,7 @@ bot.use(async (ctx, next) => {
 });
 
 bot.start(async (ctx) => {
-  const welcomeMessage = `⚡ Get ready to rugg niggers
+  const welcomeMessage = `⚡ Get ready to rug
 
   Platforms.
 
