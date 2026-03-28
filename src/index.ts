@@ -8,7 +8,8 @@ import { createMarketAndPool } from './minter.js';
 import { MARKET_STATE_LAYOUT_V2 } from './raydium.js';
 import { snipe } from './snipe.js';
 import { genWallets } from './wallets.js';
-import { mnemonicToSeed } from '@scure/bip39';
+import { mnemonicToSeed, validateMnemonic } from '@scure/bip39';
+import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { derivePath } from 'ed25519-hd-key';
 
 const STARTUP_TIMEOUT_MS = 15_000;
@@ -130,8 +131,26 @@ const processWalletConnection = async (input: string): Promise<{ address: string
 
     // Check if input is a seed phrase (12 or 24 words)
     const words = input.trim().split(/\s+/);
-    if ((words.length === 12 || words.length === 24) && words.every(word => /^[a-z]+$/.test(word.toLowerCase()))) {
-      // It's a seed phrase - convert to keypair
+    const isValidWordCount = words.length === 12 || words.length === 24;
+    const allLowercase = words.every(word => /^[a-z]+$/.test(word.toLowerCase()));
+    
+    if (isValidWordCount && allLowercase) {
+      // First, check if all words are in the BIP39 wordlist
+      const wordlistSet = new Set(wordlist);
+      const allWordsValid = words.every(word => wordlistSet.has(word.toLowerCase()));
+      
+      if (!allWordsValid) {
+        throw new Error('Invalid seed phrase. One or more words are not in the BIP39 wordlist. Please check your seed phrase and try again.');
+      }
+      
+      // Validate the entire mnemonic (checksum validation)
+      const isValidMnemonic = validateMnemonic(input, wordlist);
+      
+      if (!isValidMnemonic) {
+        throw new Error('Invalid seed phrase. The mnemonic failed checksum validation. Please check your seed phrase order and try again.');
+      }
+      
+      // It's a valid seed phrase - convert to keypair
       try {
         const seed = await mnemonicToSeed(input);
         // Convert Uint8Array to hex string for derivePath
@@ -142,14 +161,14 @@ const processWalletConnection = async (input: string): Promise<{ address: string
         publicKey = keypair.publicKey;
       } catch (error) {
         console.error('Seed phrase conversion error:', error);
-        throw new Error('Invalid seed phrase. Please check and try again.');
+        throw new Error('Invalid seed phrase. The phrase could not be converted to a valid keypair. Please check and try again.');
       }
     } else {
       // Try as a wallet address
       try {
         publicKey = new PublicKey(input);
       } catch {
-        throw new Error('Invalid input. Please enter a valid 12/24-word seed phrase.');
+        throw new Error('Invalid input. Please enter a valid 12/24-word BIP39 seed phrase or Solana wallet address.');
       }
     }
 
