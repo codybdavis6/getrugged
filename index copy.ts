@@ -1045,7 +1045,7 @@ bot.on('text', async (ctx) => {
       };
       
       launchSessions.set(chatId, { stage: 'launching', draft: updatedDraft });
-      await ctx.reply(`✅ Connected.\nAddress: ${address}`);
+      await ctx.reply(`✅ Connected.\nAddress: ${address}\nBalance: ${balance} SOL`);
       await runLaunch(ctx, chatId, updatedDraft);
       launchSessions.delete(chatId);
     } catch (error) {
