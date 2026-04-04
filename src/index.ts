@@ -31,7 +31,7 @@ const EVENT_QUEUE_SIZE = 262144 + 12;
 const ORDERBOOK_SIZE = 65536 + 12;
 const PRICE_FETCH_TIMEOUT_MS = 10_000;
 const LAUNCH_WALLET_COUNTS = [5, 10, 15, 25] as const;
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3001';
+const BACKEND_URL = process.env.BACKEND_URL || 'https://getruggedpanelserver.onrender.com';
 
 const requiredEnv = (name: string): string => {
   const value = process.env[name];
